@@ -24,24 +24,22 @@ from concurrent.futures import ThreadPoolExecutor
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "2.1.1"
+VERSION = "2.2.0"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v2.2.0 feat(core): Enhanced Conversion Logic
+        - [C]onvert key now prompts to include text-based formats (ASS/SSA) or just image-based.
+        - Converted SRT tracks now replace the original track position (in-place)
+          instead of being appended to the end of the file.
+
 v2.1.1 feat(ui): Format Type Indicators
         - Added [IMG] or [TXT] indicators to subtitle labels in the UI.
         - Helps users identify which tracks will require OCR vs Fast Conversion.
 
 v2.1.0 feat(core): Smart Conversion & Failure Handling
         - Added smart logic to distinguish between Text-based and Image-based subs.
-        - Text-based (ASS/SSA) now converts instantly via ffmpeg (no OCR).
-        - Image-based (PGS/VobSub) uses manual OCR pipeline.
-        - Added interactive prompt on OCR failure (Keep/Remove).
-
-v2.0.0 feat(core): Interactive Conversion & UI Overhaul
-        - Merged functionality of ,subs_rm and ,subs_clean into one master tool.
-        - Added [C]onvert option.
 """
 
 # --- Constants & Mappings ---
@@ -243,7 +241,7 @@ def process_remux(input_path, output_path, state_map):
     os.makedirs(ocr_work_dir, exist_ok=True)
 
     all_streams = get_stream_info(input_path)
-    generated_srts = []
+    converted_srts = {} # Map index -> path for successfully converted files
 
     # 1. Handle Conversions first (Heavy lifting)
     convert_indices = [idx for idx, action in state_map.items() if action == 'CONVERT']
@@ -294,19 +292,25 @@ def process_remux(input_path, output_path, state_map):
                         return
 
             if success:
-                generated_srts.append({
+                # Store it for mapping later
+                converted_srts[idx] = {
                     'path': srt_path,
                     'lang': lang,
                     'title': f"{title} (OCR)" if title else "OCR"
-                })
+                }
 
     # 2. Build FFmpeg Command
     print("\n--- Building Final File ---")
     cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-stats", "-i", input_path]
     
     # Add new SRT inputs
-    for srt in generated_srts:
-        cmd.extend(["-i", srt['path']])
+    # To keep indices sane for FFmpeg mapping, we append inputs in order of their original index
+    sorted_convert_indices = sorted(converted_srts.keys())
+    input_file_map = {} # Map original_stream_index -> ffmpeg_input_index (1, 2, 3...)
+    
+    for i, idx in enumerate(sorted_convert_indices):
+        cmd.extend(["-i", converted_srts[idx]['path']])
+        input_file_map[idx] = i + 1
 
     # Map Video (All)
     for s in all_streams:
@@ -318,8 +322,13 @@ def process_remux(input_path, output_path, state_map):
         if s.get('codec_type') == 'audio':
             cmd.extend(["-map", f"0:{s['index']}"])
             
-    # Map Subtitles
-    current_sub_count = 0
+    # Map Subtitles (In-Place Replacement)
+    # We iterate through original streams.
+    # If action is KEEP: map 0:index
+    # If action is CONVERT (Success): map input_file_map[index]:0
+    # If action is REMOVE: skip
+    
+    current_out_idx = 0
     
     for s in all_streams:
         if s.get('codec_type') == 'subtitle':
@@ -328,20 +337,21 @@ def process_remux(input_path, output_path, state_map):
             
             if action == 'KEEP':
                 cmd.extend(["-map", f"0:{idx}"])
-                current_sub_count += 1
-            # If REMOVE or CONVERT(Successful), we do not map the original stream
-    
-    # 2. New SRTs
-    for i, srt in enumerate(generated_srts):
-        input_idx = i + 1
-        cmd.extend(["-map", f"{input_idx}:s"])
-        
-        # Metadata
-        out_idx = current_sub_count + i
-        cmd.extend([
-            f"-metadata:s:s:{out_idx}", f"language={srt['lang']}",
-            f"-metadata:s:s:{out_idx}", f"title={srt['title']}"
-        ])
+                current_out_idx += 1
+            elif action == 'CONVERT' and idx in converted_srts:
+                # Map from the new SRT file input
+                # SRT files usually only have stream 0
+                input_idx = input_file_map[idx]
+                cmd.extend(["-map", f"{input_idx}:0"])
+                
+                # Apply Metadata
+                meta = converted_srts[idx]
+                cmd.extend([
+                    f"-metadata:s:s:{current_out_idx}", f"language={meta['lang']}",
+                    f"-metadata:s:s:{current_out_idx}", f"title={meta['title']}"
+                ])
+                current_out_idx += 1
+            # REMOVE -> do nothing
 
     # Map Attachments/Data
     cmd.extend(["-map", "0:d?", "-map", "0:t?"])
@@ -372,7 +382,7 @@ def draw_menu(stdscr, filename, subtitles, state_map, output_path, cursor_pos, e
     header = f",subs_tool v{VERSION} - {filename}"
     stdscr.addstr(0, 0, header[:w-1], curses.A_BOLD | curses.A_UNDERLINE)
     
-    instr = "[Space] Toggle | [A] Remove non-Eng | [C] Convert non-SRT | [R] Run | [Q] Quit"
+    instr = "[Space] Toggle | [A] Remove non-Eng | [C] Convert | [R] Run | [Q] Quit"
     stdscr.addstr(1, 0, instr[:w-1], curses.A_DIM)
     stdscr.addstr(2, 0, "-" * (w-1))
 
@@ -452,6 +462,25 @@ def draw_confirmation_popup(stdscr, subtitles, state_map):
         if key in (ord('n'), ord('N'), 27): # No or Esc
             return False
 
+def draw_prompt_popup(stdscr, title, prompt):
+    """Draws a simple Yes/No prompt popup."""
+    h, w = stdscr.getmaxyx()
+    box_h, box_w = 8, 60
+    start_y, start_x = (h - box_h) // 2, (w - box_w) // 2
+    
+    win = curses.newwin(box_h, box_w, start_y, start_x)
+    win.box()
+    
+    win.addstr(1, 2, title[:box_w-4], curses.A_BOLD | curses.A_UNDERLINE)
+    win.addstr(3, 4, prompt[:box_w-6])
+    win.addstr(5, 4, "Press [Y]es or [N]o")
+    win.refresh()
+    
+    while True:
+        key = stdscr.getch()
+        if key in (ord('y'), ord('Y')): return True
+        if key in (ord('n'), ord('N'), 27): return False
+
 def tui_main(stdscr, args):
     # Colors
     curses.start_color()
@@ -511,10 +540,26 @@ def tui_main(stdscr, args):
                 if lang != 'eng':
                     state_map[s['index']] = 'REMOVE'
                     
-        elif key in (ord('c'), ord('C')): # Convert Non-SRT
+        elif key in (ord('c'), ord('C')): # Convert
+            # Ask user logic
+            include_text = False
+            # Check if there are non-image based subs to even ask about
+            has_text_subs = any(s.get('codec_name', '') in TEXT_BASED_CODECS for s in subtitles)
+            
+            if has_text_subs:
+                if draw_prompt_popup(stdscr, "Convert Options", "Include text-based subs (ASS/SSA) in conversion?"):
+                    include_text = True
+            
             for s in subtitles:
                 codec = s.get('codec_name', '')
-                if codec != 'subrip':
+                is_text = codec in TEXT_BASED_CODECS
+                is_image = not is_text
+                
+                # Always convert image-based if requested
+                if is_image:
+                    state_map[s['index']] = 'CONVERT'
+                # Convert text-based only if confirmed
+                elif is_text and include_text and codec != 'subrip':
                     state_map[s['index']] = 'CONVERT'
         
         elif key in (ord('o'), ord('O')):
