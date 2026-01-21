@@ -24,21 +24,18 @@ from concurrent.futures import ThreadPoolExecutor
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "2.4.0"
+VERSION = "2.5.0"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v2.5.0 fix(core): Cleaner Track Titles
+        - Converted tracks now use suffix " - SRT" instead of "(OCR)".
+        - Ensures clean listing in players like Jellyfin (e.g. "English - SRT").
+
 v2.4.0 feat(batch): Directory Batch Mode & Apply-to-All
         - Added -d/--dir flag to process a folder of videos.
         - Implemented 'Apply to All' logic for batch jobs.
-        - Verifies track structure match before applying template settings.
-        - Falls back to interactive mode if structure differs.
-        - Added PV integration for smart progress when moving files.
-
-v2.3.0 feat(core): Reordering & In-Place Replacement
-        - Added [M]ove mode to reorder subtitle tracks.
-        - Fixed logic to ensure converted SRTs replace original position.
 """
 
 # --- Constants & Mappings ---
@@ -94,11 +91,6 @@ def get_stream_info(file_path):
         return []
 
 def get_track_structure_signature(file_path):
-    """
-    Generates a unique signature string for the subtitle structure of a file.
-    Format: "count|index:codec:lang|index:codec:lang..."
-    Used to verify if 'Apply to All' is safe.
-    """
     streams = get_stream_info(file_path)
     subs = [s for s in streams if s.get('codec_type') == 'subtitle']
     if not subs: return "NONE"
@@ -282,10 +274,13 @@ def process_remux(input_path, output_path, subs_list):
                         print("\nCancelled."); return
 
             if success:
+                # Cleaner title logic
+                clean_title = f"{sub['title']} - SRT" if sub['title'] else "SRT"
+                
                 converted_inputs[idx] = {
                     'path': srt_path,
                     'lang': sub['lang'],
-                    'title': f"{sub['title']} (OCR)" if sub['title'] else "OCR"
+                    'title': clean_title
                 }
 
     # 2. Build FFmpeg Command
