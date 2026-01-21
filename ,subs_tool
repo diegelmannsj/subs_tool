@@ -3,7 +3,8 @@
 ,subs_tool - Interactive Subtitle Manager
 
 A TUI tool to manually select, remove, or convert subtitle tracks in a video file.
-Features robust OCR for converting image-based subs (PGS/VobSub) to SRT.
+Features robust OCR for converting image-based subs (PGS/VobSub) to SRT
+and fast conversion for text-based subs (ASS/SSA).
 
 Author: Buzzy's Admin
 Target System: Fedora Linux (buzzy)
@@ -23,20 +24,20 @@ from concurrent.futures import ThreadPoolExecutor
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "2.0.0"
+VERSION = "2.1.0"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v2.1.0 feat(core): Smart Conversion & Failure Handling
+        - Added smart logic to distinguish between Text-based and Image-based subs.
+        - Text-based (ASS/SSA) now converts instantly via ffmpeg (no OCR).
+        - Image-based (PGS/VobSub) uses manual OCR pipeline.
+        - Added interactive prompt on OCR failure (Keep/Remove).
+
 v2.0.0 feat(core): Interactive Conversion & UI Overhaul
         - Merged functionality of ,subs_rm and ,subs_clean into one master tool.
-        - Added [C]onvert option to OCR image-based subtitles (PGS/VobSub) to SRT.
-        - Added [A] command to auto-mark non-English tracks for removal.
-        - Enhanced TUI with color coding (Green=Keep, Red=Remove, Cyan=Convert).
-        - Added confirmation popup window before execution.
-        - Integrated robust multi-threaded manual OCR pipeline.
-
-v1.3.0 fix(remux): Explicit Stream Mapping (Legacy ,subs_rm)
+        - Added [C]onvert option.
 """
 
 # --- Constants & Mappings ---
@@ -66,6 +67,8 @@ SUBTITLE_CODEC_MAP = {
     'eia_608': 'EIA-608',
     'dvb_subtitle': 'DVB'
 }
+
+TEXT_BASED_CODECS = {'ass', 'ssa', 'mov_text', 'webvtt', 'subrip', 'text'}
 
 # --- Core Helper Functions ---
 
@@ -138,9 +141,12 @@ def extract_single_image(input_file, stream_index, timestamp, output_path):
     except subprocess.CalledProcessError:
         return False
 
-def perform_manual_ocr(input_file, stream_index, lang_code, output_srt, temp_dir):
-    """Orchestrates image extraction, Tesseract OCR, and SRT generation."""
-    print(f"    ... Processing Stream #{stream_index} ({lang_code})...")
+def perform_manual_ocr(input_file, stream_index, lang_code, codec_friendly, output_srt, temp_dir):
+    """
+    Orchestrates image extraction, Tesseract OCR, and SRT generation.
+    Returns: (success: bool, reason: str)
+    """
+    print(f"    ... Processing Stream #{stream_index} ({lang_code}) [{codec_friendly}] via OCR...")
     
     stream_temp_dir = os.path.join(temp_dir, f"stream_{stream_index}")
     if os.path.exists(stream_temp_dir): shutil.rmtree(stream_temp_dir)
@@ -149,8 +155,7 @@ def perform_manual_ocr(input_file, stream_index, lang_code, output_srt, temp_dir
     # 1. Get Timestamps
     packets = extract_subtitle_packets(input_file, stream_index)
     if not packets:
-        print("    -> No packets found.")
-        return False
+        return False, "No packets found in stream."
 
     # 2. Extract Images (Parallel)
     print(f"    -> Rendering {len(packets)} images (Multithreaded)...")
@@ -161,7 +166,7 @@ def perform_manual_ocr(input_file, stream_index, lang_code, output_srt, temp_dir
     
     # 3. OCR Loop
     images = sorted(glob.glob(os.path.join(stream_temp_dir, "*.tif")))
-    if not images: return False
+    if not images: return False, "No images extracted."
     
     count = min(len(images), len(packets))
     print(f"    -> OCRing {count} lines...")
@@ -189,14 +194,30 @@ def perform_manual_ocr(input_file, stream_index, lang_code, output_srt, temp_dir
     
     # 4. Write SRT
     if not srt_lines:
-        print("    -> No text recognized.")
-        return False
+        return False, "No text recognized by Tesseract."
         
     with open(output_srt, 'w', encoding='utf-8') as f:
         f.write("\n".join(srt_lines))
     
     shutil.rmtree(stream_temp_dir)
-    return True
+    return True, "Success"
+
+def perform_text_conversion(input_file, stream_index, output_srt):
+    """Fast conversion for text-based subtitles (ASS/SSA/MovText)."""
+    print(f"    ... Converting Stream #{stream_index} (Text-Based) -> SRT...")
+    cmd = [
+        "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+        "-i", input_file,
+        "-map", f"0:{stream_index}",
+        "-c:s", "srt",
+        "-y", output_srt
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"    -> Conversion Failed: {e}")
+        return False
 
 # --- Main Processing Logic ---
 
@@ -219,8 +240,14 @@ def process_remux(input_path, output_path, state_map):
     
     if convert_indices:
         print("\n--- Starting Conversion Phase ---")
-        if not shutil.which("tesseract"):
-            print("Error: Tesseract not installed. Cannot convert.")
+        
+        # Check Tesseract only if we actually need OCR (image-based subs exist in list)
+        has_image_subs = any(
+            next((s for s in all_streams if s['index'] == idx), {}).get('codec_name', '') not in TEXT_BASED_CODECS
+            for idx in convert_indices
+        )
+        if has_image_subs and not shutil.which("tesseract"):
+            print("Error: Tesseract not installed. Cannot convert image-based subs.")
             return
 
         for idx in convert_indices:
@@ -230,17 +257,38 @@ def process_remux(input_path, output_path, state_map):
             
             lang = stream.get('tags', {}).get('language', 'eng')
             title = stream.get('tags', {}).get('title', '')
+            codec_raw = stream.get('codec_name', 'unknown')
+            codec_friendly = SUBTITLE_CODEC_MAP.get(codec_raw, codec_raw)
+
             srt_path = os.path.join(ocr_work_dir, f"converted_{idx}.srt")
+            success = False
             
-            if perform_manual_ocr(input_path, idx, lang, srt_path, ocr_work_dir):
+            # Smart Branching
+            if codec_raw in TEXT_BASED_CODECS:
+                success = perform_text_conversion(input_path, idx, srt_path)
+            else:
+                success, reason = perform_manual_ocr(input_path, idx, lang, codec_friendly, srt_path, ocr_work_dir)
+                if not success:
+                    print(f"Warning: OCR Failed for Stream #{idx}. Reason: {reason}")
+                    # Interactive Failure Handling
+                    try:
+                        choice = input(f"    How do you want to handle this track? [K]eep Original or [R]emove? [K/r]: ").lower().strip()
+                        if choice == 'r':
+                            print(f"    -> Marking Stream #{idx} for REMOVAL.")
+                            state_map[idx] = 'REMOVE'
+                        else:
+                            print(f"    -> Keeping Stream #{idx} as original.")
+                            state_map[idx] = 'KEEP'
+                    except KeyboardInterrupt:
+                        print("\nCancelled.")
+                        return
+
+            if success:
                 generated_srts.append({
                     'path': srt_path,
                     'lang': lang,
                     'title': f"{title} (OCR)" if title else "OCR"
                 })
-            else:
-                print(f"Warning: Failed to convert stream #{idx}. It will be kept as original.")
-                state_map[idx] = 'KEEP' # Fallback
 
     # 2. Build FFmpeg Command
     print("\n--- Building Final File ---")
@@ -261,9 +309,6 @@ def process_remux(input_path, output_path, state_map):
             cmd.extend(["-map", f"0:{s['index']}"])
             
     # Map Subtitles
-    # 1. Existing Subs (that are marked KEEP or failed conversion)
-    #    Note: 'CONVERT' status implies we remove the original and map the new one?
-    #    Usually yes. If user selected Convert, they want SRT *instead* of image.
     current_sub_count = 0
     
     for s in all_streams:
@@ -274,10 +319,9 @@ def process_remux(input_path, output_path, state_map):
             if action == 'KEEP':
                 cmd.extend(["-map", f"0:{idx}"])
                 current_sub_count += 1
-            # If REMOVE or CONVERT, we do not map the original stream 0:idx
+            # If REMOVE or CONVERT(Successful), we do not map the original stream
     
     # 2. New SRTs
-    # Input 0 is video. Inputs 1..N are SRTs
     for i, srt in enumerate(generated_srts):
         input_idx = i + 1
         cmd.extend(["-map", f"{input_idx}:s"])
@@ -352,10 +396,6 @@ def draw_menu(stdscr, filename, subtitles, state_map, output_path, cursor_pos, e
         if idx_in_list == cursor_pos and not edit_mode:
             style |= curses.A_REVERSE
             
-        # Highlight non-SRT codecs in list if not selected?
-        # Actually, let's just make the label bold if it's image based?
-        # Simpler: just print the line.
-        
         line = f" {check} {label}"
         stdscr.addstr(list_start_y + i, 0, line[:w-1], style)
 
@@ -465,11 +505,6 @@ def tui_main(stdscr, args):
             for s in subtitles:
                 codec = s.get('codec_name', '')
                 if codec != 'subrip':
-                    # Only mark if not already removed? Or override remove?
-                    # Usually better to override 'KEEP', leave 'REMOVE' alone?
-                    # Let's verify: User wants to convert all non-SRT.
-                    # We should probably force it unless user explicitly removed it?
-                    # Implementation: Mark CONVERT. User can toggle off later.
                     state_map[s['index']] = 'CONVERT'
         
         elif key in (ord('o'), ord('O')):
@@ -480,7 +515,6 @@ def tui_main(stdscr, args):
             if draw_confirmation_popup(stdscr, subtitles, state_map):
                 break # Proceed to process
             else:
-                # Just redraw menu loop
                 pass
 
     return output_path, state_map
