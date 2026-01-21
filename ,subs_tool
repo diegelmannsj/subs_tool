@@ -24,11 +24,15 @@ from concurrent.futures import ThreadPoolExecutor
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "2.1.0"
+VERSION = "2.1.1"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v2.1.1 feat(ui): Format Type Indicators
+        - Added [IMG] or [TXT] indicators to subtitle labels in the UI.
+        - Helps users identify which tracks will require OCR vs Fast Conversion.
+
 v2.1.0 feat(core): Smart Conversion & Failure Handling
         - Added smart logic to distinguish between Text-based and Image-based subs.
         - Text-based (ASS/SSA) now converts instantly via ffmpeg (no OCR).
@@ -96,12 +100,18 @@ def format_subtitle_label(stream):
     idx = stream.get('index')
     codec_raw = stream.get('codec_name', 'unknown')
     codec_friendly = SUBTITLE_CODEC_MAP.get(codec_raw, codec_raw)
+    
+    # Determine Type [IMG] or [TXT]
+    type_tag = "[TXT]" if codec_raw in TEXT_BASED_CODECS else "[IMG]"
+    
     tags = stream.get('tags', {})
     lang_code = tags.get('language', 'und')
     lang_name = ISO_639_MAP.get(lang_code, lang_code)
+    
     title = tags.get('title', '')
     title_str = f" - {title}" if title else ""
-    return f"Stream #{idx}: {lang_name} [{lang_code}] [{codec_friendly}]{title_str}"
+    
+    return f"Stream #{idx}: {lang_name} [{lang_code}] [{codec_friendly}] {type_tag}{title_str}"
 
 # --- OCR Pipeline ---
 
