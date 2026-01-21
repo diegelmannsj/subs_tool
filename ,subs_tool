@@ -24,19 +24,21 @@ from concurrent.futures import ThreadPoolExecutor
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "2.3.0"
+VERSION = "2.4.0"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
-v2.3.0 feat(core): Reordering & In-Place Replacement
-        - Added [M]ove mode to reorder subtitle tracks (Up/Down arrows).
-        - Converted/Kept tracks are mapped in the user-defined order.
-        - Confirmation popup now shows a detailed list of the final output tracks.
-        - Fixed logic to ensure converted SRTs replace the original track position.
+v2.4.0 feat(batch): Directory Batch Mode & Apply-to-All
+        - Added -d/--dir flag to process a folder of videos.
+        - Implemented 'Apply to All' logic for batch jobs.
+        - Verifies track structure match before applying template settings.
+        - Falls back to interactive mode if structure differs.
+        - Added PV integration for smart progress when moving files.
 
-v2.2.0 feat(core): Enhanced Conversion Logic
-        - [C]onvert key prompts for text-based inclusion.
+v2.3.0 feat(core): Reordering & In-Place Replacement
+        - Added [M]ove mode to reorder subtitle tracks.
+        - Fixed logic to ensure converted SRTs replace original position.
 """
 
 # --- Constants & Mappings ---
@@ -68,6 +70,7 @@ SUBTITLE_CODEC_MAP = {
 }
 
 TEXT_BASED_CODECS = {'ass', 'ssa', 'mov_text', 'webvtt', 'subrip', 'text'}
+VIDEO_EXTS = ('.mkv', '.mp4', '.avi')
 
 # --- Core Helper Functions ---
 
@@ -90,16 +93,30 @@ def get_stream_info(file_path):
     except Exception:
         return []
 
+def get_track_structure_signature(file_path):
+    """
+    Generates a unique signature string for the subtitle structure of a file.
+    Format: "count|index:codec:lang|index:codec:lang..."
+    Used to verify if 'Apply to All' is safe.
+    """
+    streams = get_stream_info(file_path)
+    subs = [s for s in streams if s.get('codec_type') == 'subtitle']
+    if not subs: return "NONE"
+    
+    sig_parts = [str(len(subs))]
+    for s in subs:
+        idx = s['index']
+        codec = s.get('codec_name', 'unk')
+        lang = s.get('tags', {}).get('language', 'und')
+        sig_parts.append(f"{idx}:{codec}:{lang}")
+    
+    return "|".join(sig_parts)
+
 def format_track_label(sub_dict):
-    """
-    Generates a label from a subtitle dictionary (internal structure).
-    """
     lang_name = ISO_639_MAP.get(sub_dict['lang'], sub_dict['lang'])
     codec = sub_dict['codec_friendly']
     type_tag = "[TXT]" if sub_dict['is_text'] else "[IMG]"
     title_str = f" - {sub_dict['title']}" if sub_dict['title'] else ""
-    
-    # Original Index mainly for debugging/reference
     return f"{lang_name} [{sub_dict['lang']}] [{codec}] {type_tag}{title_str}"
 
 # --- OCR Pipeline ---
@@ -189,6 +206,35 @@ def perform_text_conversion(input_file, stream_index, output_srt):
 
 # --- Main Processing Logic ---
 
+def smart_move_file(source, destination):
+    """
+    Moves file using 'pv' for progress if on different filesystems,
+    otherwise uses atomic rename.
+    """
+    try:
+        # Check filesystems
+        src_dev = os.stat(source).st_dev
+        dest_dir = os.path.dirname(os.path.abspath(destination))
+        if not os.path.exists(dest_dir): os.makedirs(dest_dir)
+        dest_dev = os.stat(dest_dir).st_dev
+        
+        # If different devices and pv exists, pipe it
+        if src_dev != dest_dev and shutil.which('pv'):
+            print(f"Moving to: {destination} (via pv)...")
+            size = os.path.getsize(source)
+            cmd = f"pv \"{source}\" -s {size} > \"{destination}\""
+            subprocess.run(cmd, shell=True, check=True)
+            os.remove(source)
+            return True
+        else:
+            # Same device OR no pv -> Standard Move
+            print(f"Moving to: {destination}...")
+            shutil.move(source, destination)
+            return True
+    except Exception as e:
+        print(f"Error moving file: {e}")
+        return False
+
 def process_remux(input_path, output_path, subs_list):
     """
     subs_list: List of dicts representing the FINAL desired order.
@@ -246,30 +292,25 @@ def process_remux(input_path, output_path, subs_list):
     print("\n--- Building Final File ---")
     cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-stats", "-i", input_path]
     
-    # Add SRT inputs. Store mapping: original_idx -> ffmpeg input index (1, 2, 3...)
-    # We load them in order of original index to keep things tidy
     sorted_conv_indices = sorted(converted_inputs.keys())
     input_file_map = {}
     for i, idx in enumerate(sorted_conv_indices):
         cmd.extend(["-i", converted_inputs[idx]['path']])
         input_file_map[idx] = i + 1
 
-    # Map Video & Audio (All, preserving original order)
+    # Map Video & Audio
     for s in all_streams:
         if s.get('codec_type') == 'video': cmd.extend(["-map", f"0:{s['index']}"])
     for s in all_streams:
         if s.get('codec_type') == 'audio': cmd.extend(["-map", f"0:{s['index']}"])
             
-    # Map Subtitles (User-Defined Order)
-    # We iterate through 'subs_list', which is already re-ordered by the user
+    # Map Subtitles
     current_out_idx = 0
-    
     for sub in subs_list:
         status = sub['status']
         orig_idx = sub['original_index']
         
-        if status == 'REMOVE':
-            continue
+        if status == 'REMOVE': continue
             
         elif status == 'KEEP':
             cmd.extend(["-map", f"0:{orig_idx}"])
@@ -277,11 +318,8 @@ def process_remux(input_path, output_path, subs_list):
             
         elif status == 'CONVERT':
             if orig_idx in converted_inputs:
-                # Map from the new SRT input
                 input_idx = input_file_map[orig_idx]
                 cmd.extend(["-map", f"{input_idx}:0"])
-                
-                # Apply Metadata
                 meta = converted_inputs[orig_idx]
                 cmd.extend([
                     f"-metadata:s:s:{current_out_idx}", f"language={meta['lang']}",
@@ -289,7 +327,7 @@ def process_remux(input_path, output_path, subs_list):
                 ])
                 current_out_idx += 1
             else:
-                # Fallback if conversion marked success but not in map (shouldn't happen)
+                # Fallback
                 cmd.extend(["-map", f"0:{orig_idx}"])
                 current_out_idx += 1
 
@@ -300,9 +338,8 @@ def process_remux(input_path, output_path, subs_list):
     try:
         subprocess.run(cmd, check=True)
         if os.path.exists(temp_final) and os.path.getsize(temp_final) > 0:
-            print(f"Moving to: {output_path}")
-            shutil.move(temp_final, output_path)
-            print("Success!")
+            if smart_move_file(temp_final, output_path):
+                print("Success!")
         else: print("Error: Output empty.")
     except subprocess.CalledProcessError as e: print(f"FFmpeg Error: {e}")
     finally:
@@ -313,15 +350,12 @@ def process_remux(input_path, output_path, subs_list):
 def draw_menu(stdscr, filename, subtitles, output_path, cursor_pos, edit_mode, move_mode):
     stdscr.clear()
     h, w = stdscr.getmaxyx()
-    
-    # Header
     header = f",subs_tool v{VERSION} - {filename}"
     stdscr.addstr(0, 0, header[:w-1], curses.A_BOLD | curses.A_UNDERLINE)
     
-    # Instructions line
     if move_mode:
         instr = "[UP/DOWN] Move Track | [M] Exit Move Mode"
-        color = curses.color_pair(4) # Yellow/Warning color for move mode
+        color = curses.color_pair(4)
     else:
         instr = "[Space] Toggle | [M] Move | [A] No-Eng | [C] Convert | [R] Run | [Q] Quit"
         color = curses.A_DIM
@@ -329,7 +363,6 @@ def draw_menu(stdscr, filename, subtitles, output_path, cursor_pos, edit_mode, m
     stdscr.addstr(1, 0, instr[:w-1], color)
     stdscr.addstr(2, 0, "-" * (w-1))
 
-    # List
     list_start_y = 3
     max_visible = h - 6
     scroll_offset = max(0, cursor_pos - max_visible + 1)
@@ -342,22 +375,17 @@ def draw_menu(stdscr, filename, subtitles, output_path, cursor_pos, edit_mode, m
         label = format_track_label(sub)
         status = sub['status']
         
-        # Style
         color = curses.color_pair(2) # Green KEEP
         check = "[ ] KEEP   "
         if status == 'REMOVE':
-            color = curses.color_pair(1) # Red
-            check = "[*] REMOVE "
+            color = curses.color_pair(1); check = "[*] REMOVE "
         elif status == 'CONVERT':
-            color = curses.color_pair(3) # Cyan
-            check = "[C] CONVERT"
+            color = curses.color_pair(3); check = "[C] CONVERT"
             
         style = color
-        
-        # Highlight Logic
         if idx_in_list == cursor_pos and not edit_mode:
             if move_mode:
-                style = curses.color_pair(4) | curses.A_BOLD # Yellow for moving item
+                style = curses.color_pair(4) | curses.A_BOLD
                 check = " < MOVE >  "
             else:
                 style |= curses.A_REVERSE
@@ -365,7 +393,6 @@ def draw_menu(stdscr, filename, subtitles, output_path, cursor_pos, edit_mode, m
         line = f" {check} {label}"
         stdscr.addstr(list_start_y + i, 0, line[:w-1], style)
 
-    # Output
     out_y = h - 2
     lbl = "Output: "
     stdscr.addstr(out_y, 0, lbl, curses.A_BOLD)
@@ -376,56 +403,49 @@ def draw_menu(stdscr, filename, subtitles, output_path, cursor_pos, edit_mode, m
     stdscr.addstr(out_y, len(lbl), disp_path, style_path)
     stdscr.refresh()
 
-def draw_confirmation_popup(stdscr, subtitles):
-    """Draws a detailed scrollable confirmation list."""
+def draw_confirmation_popup(stdscr, subtitles, is_batch=False):
     h, w = stdscr.getmaxyx()
     box_h, box_w = h - 4, w - 8
     start_y, start_x = 2, 4
-    
     win = curses.newwin(box_h, box_w, start_y, start_x)
     win.keypad(True)
     win.box()
     
-    win.addstr(1, 2, "FINAL TRACK LIST PREVIEW", curses.A_BOLD | curses.A_UNDERLINE)
-    win.addstr(box_h-2, 2, "Press [Y]es to Proceed, [N]o/Esc to Cancel, [Up/Down] Scroll")
+    title = "FINAL TRACK LIST PREVIEW"
+    if is_batch: title += " (TEMPLATE FOR BATCH)"
+    win.addstr(1, 2, title, curses.A_BOLD | curses.A_UNDERLINE)
     
-    # Filter final list (exclude removed)
+    instr = "Press [Y]es to Proceed"
+    if is_batch: instr += ", [A]pply to All"
+    instr += ", [N]o/Esc to Cancel"
+    win.addstr(box_h-2, 2, instr)
+    
     final_list = [s for s in subtitles if s['status'] != 'REMOVE']
-    
     scroll_pos = 0
     max_lines = box_h - 4
     
     while True:
-        # Draw Content
         for i in range(max_lines):
             idx = i + scroll_pos
             if idx >= len(final_list):
-                # Clear empty lines
                 win.addstr(2+i, 2, " " * (box_w - 4))
                 continue
-                
             sub = final_list[idx]
-            # Format: 1. English [SRT] (Converted)
             prefix = f"{idx+1}. "
-            
             lang_name = ISO_639_MAP.get(sub['lang'], sub['lang'])
             codec = sub['codec_friendly']
             note = ""
-            
-            attr = curses.color_pair(2) # Green
+            attr = curses.color_pair(2)
             if sub['status'] == 'CONVERT':
-                codec = "SRT"
-                note = " (Converted)"
-                attr = curses.color_pair(3) # Cyan
-                
+                codec = "SRT"; note = " (Converted)"; attr = curses.color_pair(3)
             line = f"{prefix}{lang_name} [{codec}]{note}"
             win.addstr(2+i, 2, line[:box_w-4].ljust(box_w-4), attr)
-            
-        win.refresh()
         
+        win.refresh()
         key = win.getch()
-        if key in (ord('y'), ord('Y'), 10, 13): return True
-        if key in (ord('n'), ord('N'), 27): return False
+        if key in (ord('y'), ord('Y'), 10, 13): return 'Y'
+        if key in (ord('n'), ord('N'), 27): return 'N'
+        if is_batch and key in (ord('a'), ord('A')): return 'A'
         
         if key == curses.KEY_DOWN:
             if scroll_pos < len(final_list) - max_lines: scroll_pos += 1
@@ -447,26 +467,11 @@ def draw_prompt_popup(stdscr, title, prompt):
         if key in (ord('y'), ord('Y')): return True
         if key in (ord('n'), ord('N'), 27): return False
 
-def tui_main(stdscr, args):
-    curses.start_color()
-    curses.use_default_colors()
-    curses.init_pair(1, curses.COLOR_RED, -1)    # Remove
-    curses.init_pair(2, curses.COLOR_GREEN, -1)  # Keep
-    curses.init_pair(3, curses.COLOR_CYAN, -1)   # Convert
-    curses.init_pair(4, curses.COLOR_YELLOW, -1) # Moving
-    
-    curses.curs_set(0)
-    stdscr.timeout(100)
-    
-    input_path = os.path.abspath(args.input)
-    filename = os.path.basename(input_path)
-    output_path = input_path
-    
-    raw_streams = get_stream_info(input_path)
+def init_subtitles(file_path):
+    raw_streams = get_stream_info(file_path)
     raw_subs = [s for s in raw_streams if s.get('codec_type') == 'subtitle']
     if not raw_subs: return None
     
-    # Initialize Internal List Structure
     subtitles = []
     for s in raw_subs:
         codec_raw = s.get('codec_name', 'unknown')
@@ -479,6 +484,24 @@ def tui_main(stdscr, args):
             'is_text': codec_raw in TEXT_BASED_CODECS,
             'status': 'KEEP'
         })
+    return subtitles
+
+def tui_main(stdscr, args, file_path, is_batch=False):
+    curses.start_color()
+    curses.use_default_colors()
+    curses.init_pair(1, curses.COLOR_RED, -1)    # Remove
+    curses.init_pair(2, curses.COLOR_GREEN, -1)  # Keep
+    curses.init_pair(3, curses.COLOR_CYAN, -1)   # Convert
+    curses.init_pair(4, curses.COLOR_YELLOW, -1) # Moving
+    
+    curses.curs_set(0)
+    stdscr.timeout(100)
+    
+    filename = os.path.basename(file_path)
+    output_path = file_path
+    
+    subtitles = init_subtitles(file_path)
+    if not subtitles: return None
     
     cursor_pos = 0
     edit_mode = False
@@ -489,48 +512,40 @@ def tui_main(stdscr, args):
         key = stdscr.getch()
         
         if edit_mode:
-            if key in (10, 13, 27): 
-                edit_mode = False; curses.curs_set(0)
+            if key in (10, 13, 27): edit_mode = False; curses.curs_set(0)
             elif key in (curses.KEY_BACKSPACE, 127, 8): output_path = output_path[:-1]
             elif 32 <= key <= 126: output_path += chr(key)
             continue
             
         if move_mode:
-            if key == curses.KEY_UP:
-                if cursor_pos > 0:
-                    # Swap
-                    subtitles[cursor_pos], subtitles[cursor_pos-1] = subtitles[cursor_pos-1], subtitles[cursor_pos]
-                    cursor_pos -= 1
-            elif key == curses.KEY_DOWN:
-                if cursor_pos < len(subtitles) - 1:
-                    subtitles[cursor_pos], subtitles[cursor_pos+1] = subtitles[cursor_pos+1], subtitles[cursor_pos]
-                    cursor_pos += 1
-            elif key in (ord('m'), ord('M'), 27, 10, 13):
-                move_mode = False
+            if key == curses.KEY_UP and cursor_pos > 0:
+                subtitles[cursor_pos], subtitles[cursor_pos-1] = subtitles[cursor_pos-1], subtitles[cursor_pos]
+                cursor_pos -= 1
+            elif key == curses.KEY_DOWN and cursor_pos < len(subtitles) - 1:
+                subtitles[cursor_pos], subtitles[cursor_pos+1] = subtitles[cursor_pos+1], subtitles[cursor_pos]
+                cursor_pos += 1
+            elif key in (ord('m'), ord('M'), 27, 10, 13): move_mode = False
             continue
 
-        # Normal Mode
         if key in (ord('q'), ord('Q')): sys.exit(0)
         elif key == curses.KEY_UP: cursor_pos = max(0, cursor_pos - 1)
         elif key == curses.KEY_DOWN: cursor_pos = min(len(subtitles)-1, cursor_pos + 1)
         
-        elif key == ord(' '): # Toggle
+        elif key == ord(' '): 
             curr = subtitles[cursor_pos]['status']
             if curr == 'KEEP': subtitles[cursor_pos]['status'] = 'REMOVE'
             elif curr == 'REMOVE': subtitles[cursor_pos]['status'] = 'KEEP'
             elif curr == 'CONVERT': subtitles[cursor_pos]['status'] = 'REMOVE'
             
-        elif key in (ord('a'), ord('A')): # Remove Non-Eng
+        elif key in (ord('a'), ord('A')): 
             for s in subtitles:
                 if s['lang'] != 'eng': s['status'] = 'REMOVE'
                 
-        elif key in (ord('c'), ord('C')): # Convert
+        elif key in (ord('c'), ord('C')): 
             include_text = False
             has_text = any(s['is_text'] for s in subtitles)
             if has_text:
-                if draw_prompt_popup(stdscr, "Convert Options", "Include text-based subs?"):
-                    include_text = True
-            
+                if draw_prompt_popup(stdscr, "Convert Options", "Include text-based subs?"): include_text = True
             for s in subtitles:
                 if not s['is_text']: s['status'] = 'CONVERT'
                 elif include_text and s['codec_raw'] != 'subrip': s['status'] = 'CONVERT'
@@ -539,44 +554,118 @@ def tui_main(stdscr, args):
         elif key in (ord('o'), ord('O')): edit_mode = True; curses.curs_set(1)
         
         elif key in (ord('r'), ord('R')):
-            if draw_confirmation_popup(stdscr, subtitles):
-                break
+            conf = draw_confirmation_popup(stdscr, subtitles, is_batch)
+            if conf in ('Y', 'A'): return output_path, subtitles, conf
+            
+    return None
 
-    return output_path, subtitles
+def scan_directory(path, recursive):
+    vids = []
+    if recursive:
+        for root, dirs, files in os.walk(path):
+            # Skip system/metadata dirs
+            dirs[:] = [d for d in dirs if d not in ('.trickplay', '.bif', 'Backdrops', 'metadata')]
+            for f in files:
+                if f.lower().endswith(VIDEO_EXTS): vids.append(os.path.join(root, f))
+    else:
+        for f in os.listdir(path):
+            if f.lower().endswith(VIDEO_EXTS): vids.append(os.path.join(path, f))
+    return sorted(vids)
+
+def apply_template_to_file(file_path, template_subs):
+    """
+    Applies logic from template_subs to new file.
+    template_subs contains user desired state (reordered, statuses set).
+    We must map this logic to the new file's tracks.
+    Assumption: New file has identical structure (verified before calling).
+    """
+    new_subs = init_subtitles(file_path)
+    if not new_subs: return None
+    
+    # Map actions by original index position
+    # The template_subs list might be REORDERED.
+    # We need to construct a new list for the current file that matches that reordering and status.
+    
+    final_subs = []
+    
+    # Iterate through the template list (which represents the desired output order)
+    for template_item in template_subs:
+        # Find the corresponding track in the new file based on original index
+        # Since structure is identical, the track at original_index X in template corresponds to original_index X in new file
+        orig_idx = template_item['original_index']
+        
+        matching_sub = next((s for s in new_subs if s['original_index'] == orig_idx), None)
+        
+        if matching_sub:
+            # Apply status from template
+            matching_sub['status'] = template_item['status']
+            final_subs.append(matching_sub)
+            
+    return final_subs
 
 def main():
     parser = argparse.ArgumentParser(description="Interactive Subtitle Tool")
     parser.add_argument("-i", "--input", help="Input video file")
+    parser.add_argument("-d", "--dir", help="Input directory (Batch Mode)")
+    parser.add_argument("-R", "--recursive", action="store_true", help="Recursive scan (for -d)")
     parser.add_argument("-v", "--version", action="store_true", help="Show history")
     args = parser.parse_args()
 
     print_version()
     if args.version: print(VERSION_HISTORY); sys.exit(0)
-    if not args.input or not os.path.exists(args.input):
-        print("Error: Input file required."); sys.exit(1)
-
-    streams = get_stream_info(args.input)
-    if not any(s.get('codec_type') == 'subtitle' for s in streams):
-        print("No subtitle tracks found."); sys.exit(0)
-
-    try:
-        result = curses.wrapper(tui_main, args)
-    except KeyboardInterrupt: print("\nCancelled."); sys.exit(0)
-        
-    if not result: sys.exit(0)
-    out_path, subs_list = result
     
-    actions = [s for s in subs_list if s['status'] in ('REMOVE', 'CONVERT')]
-    # Check if reorder happened (indices out of sync)
-    reordered = False
-    for i, s in enumerate(subs_list):
-        if i != sorted(subs_list, key=lambda x: x['original_index']).index(s):
-            reordered = True; break
-            
-    if not actions and not reordered:
-        print("No changes selected."); sys.exit(0)
+    files_to_process = []
+    if args.input:
+        if os.path.exists(args.input): files_to_process = [args.input]
+        else: print("Error: File not found."); sys.exit(1)
+    elif args.dir:
+        if os.path.exists(args.dir):
+            files_to_process = scan_directory(args.dir, args.recursive)
+            if not files_to_process: print("No video files found in directory."); sys.exit(0)
+        else: print("Error: Directory not found."); sys.exit(1)
+    else:
+        print("Error: -i or -d required."); sys.exit(1)
+
+    # Batch State
+    apply_all_mode = False
+    template_signature = ""
+    template_subs_config = []
+
+    for idx, fpath in enumerate(files_to_process):
+        print(f"\nProcessing {idx+1}/{len(files_to_process)}: {os.path.basename(fpath)}")
         
-    process_remux(args.input, out_path, subs_list)
+        # Check if we can apply template
+        if apply_all_mode:
+            current_sig = get_track_structure_signature(fpath)
+            if current_sig == template_signature:
+                print("  -> Applying template settings...")
+                subs_list = apply_template_to_file(fpath, template_subs_config)
+                process_remux(fpath, fpath, subs_list)
+                continue
+            else:
+                print("  -> Structure mismatch! Falling back to interactive mode.")
+                time.sleep(1) # Let user see message
+
+        # Interactive Mode
+        try:
+            # Pass is_batch flag to enable 'Apply to All' in UI
+            res = curses.wrapper(tui_main, args, fpath, is_batch=(len(files_to_process) > 1))
+        except KeyboardInterrupt: print("\nCancelled."); sys.exit(0)
+        
+        if not res: 
+            print("Skipped/Quit."); 
+            if len(files_to_process) == 1: sys.exit(0)
+            continue
+            
+        out_path, subs_list, confirmation = res
+        
+        if confirmation == 'A':
+            apply_all_mode = True
+            template_signature = get_track_structure_signature(fpath)
+            template_subs_config = subs_list # Save the reordered/configured list
+            print("  -> Template saved. Applying to remaining files...")
+            
+        process_remux(fpath, out_path, subs_list)
 
 if __name__ == "__main__":
     main()
