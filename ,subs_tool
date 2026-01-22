@@ -24,18 +24,19 @@ from concurrent.futures import ThreadPoolExecutor
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "2.5.0"
+VERSION = "2.7.0"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
-v2.5.0 fix(core): Cleaner Track Titles
-        - Converted tracks now use suffix " - SRT" instead of "(OCR)".
-        - Ensures clean listing in players like Jellyfin (e.g. "English - SRT").
+v2.7.0 feat(core): External Subtitle Support
+        - Scans for sidecar subtitle files (.srt, .sub, .ass, etc.)
+        - Displays external subs in the list (marked [EXTERNAL]).
+        - Allows Keeping (Embedding), Removing (Ignoring), or Converting external subs.
+        - Supports converting external VobSub (.sub/.idx) to internal SRT.
 
-v2.4.0 feat(batch): Directory Batch Mode & Apply-to-All
-        - Added -d/--dir flag to process a folder of videos.
-        - Implemented 'Apply to All' logic for batch jobs.
+v2.6.0 feat(core): Verbosity Controls
+        - Added -V/--verbose (default), -VV/--very-verbose, -q/--quiet.
 """
 
 # --- Constants & Mappings ---
@@ -68,12 +69,21 @@ SUBTITLE_CODEC_MAP = {
 
 TEXT_BASED_CODECS = {'ass', 'ssa', 'mov_text', 'webvtt', 'subrip', 'text'}
 VIDEO_EXTS = ('.mkv', '.mp4', '.avi')
+SUB_EXTS = ('.srt', '.sub', '.ass', '.ssa', '.vtt', '.idx') 
+# Note: .idx usually accompanies .sub, we scan for .sub mostly but handle idx logic if needed.
+
+# --- Logging Helper ---
+VERBOSITY = 1  # 0=Quiet, 1=Verbose(Default), 2=VeryVerbose
+
+def log(msg, level=1):
+    if VERBOSITY >= level:
+        print(msg)
 
 # --- Core Helper Functions ---
 
 def print_version():
-    print(f",subs_tool - Version {VERSION}")
-    print("-" * 30)
+    log(f",subs_tool - Version {VERSION}", 1)
+    log("-" * 30, 1)
 
 def format_timestamp(seconds):
     if seconds is None: return "00:00:00,000"
@@ -91,9 +101,10 @@ def get_stream_info(file_path):
         return []
 
 def get_track_structure_signature(file_path):
+    # This signature logic currently only looks at internal streams.
+    # It effectively disables 'Apply to All' safety for external subs variation, which is safer.
     streams = get_stream_info(file_path)
     subs = [s for s in streams if s.get('codec_type') == 'subtitle']
-    if not subs: return "NONE"
     
     sig_parts = [str(len(subs))]
     for s in subs:
@@ -109,11 +120,75 @@ def format_track_label(sub_dict):
     codec = sub_dict['codec_friendly']
     type_tag = "[TXT]" if sub_dict['is_text'] else "[IMG]"
     title_str = f" - {sub_dict['title']}" if sub_dict['title'] else ""
-    return f"{lang_name} [{sub_dict['lang']}] [{codec}] {type_tag}{title_str}"
+    
+    if sub_dict.get('is_external'):
+        return f"[EXTERNAL] {lang_name} [{codec}] {type_tag} ({os.path.basename(sub_dict['file_path'])})"
+    
+    return f"Stream #{sub_dict['original_index']}: {lang_name} [{sub_dict['lang']}] [{codec}] {type_tag}{title_str}"
+
+# --- Scanning External Subs ---
+
+def scan_external_subs(video_path):
+    """
+    Scans for subtitle files in the same directory as video_path.
+    Returns list of dicts representing external subs.
+    """
+    base_dir = os.path.dirname(video_path)
+    base_name = os.path.splitext(os.path.basename(video_path))[0]
+    
+    external_subs = []
+    
+    # Simple scan: look for files starting with base_name and having sub extension
+    try:
+        for f in os.listdir(base_dir):
+            if f.startswith(base_name) and f.lower().endswith(SUB_EXTS):
+                # Avoid .idx files directly if .sub exists, usually handled together
+                if f.lower().endswith('.idx'): continue
+                
+                full_path = os.path.join(base_dir, f)
+                
+                # Probe it to get codec/lang details
+                streams = get_stream_info(full_path)
+                # Usually external files have 1 stream
+                if streams:
+                    s = streams[0]
+                    codec_raw = s.get('codec_name', 'unknown')
+                    
+                    # Try to guess language from filename if not in stream metadata
+                    # naming convention: Movie.eng.srt or Movie.English.srt
+                    lang = 'und'
+                    # Naive language detection from filename
+                    parts = f.split('.')
+                    if len(parts) > 2:
+                        potential_lang = parts[-2].lower()
+                        if len(potential_lang) == 3 and potential_lang in ISO_639_MAP:
+                            lang = potential_lang
+                        elif potential_lang in ['english', 'en']: lang = 'eng'
+                    
+                    # Use ffprobe metadata if available and valid
+                    if s.get('tags', {}).get('language', 'und') != 'und':
+                        lang = s.get('tags', {}).get('language')
+
+                    external_subs.append({
+                        'original_index': -1 * (len(external_subs) + 1), # -1, -2...
+                        'is_external': True,
+                        'file_path': full_path,
+                        'lang': lang,
+                        'title': 'External', # Default title
+                        'codec_raw': codec_raw,
+                        'codec_friendly': SUBTITLE_CODEC_MAP.get(codec_raw, codec_raw),
+                        'is_text': codec_raw in TEXT_BASED_CODECS,
+                        'status': 'KEEP' # Default to Keep (Embed)
+                    })
+    except OSError:
+        pass
+        
+    return external_subs
 
 # --- OCR Pipeline ---
 
 def extract_subtitle_packets(input_file, stream_index):
+    # Note: For external files, stream_index is usually 0
     cmd = [
         "ffprobe", "-v", "quiet", 
         "-select_streams", f"{stream_index}",
@@ -145,7 +220,7 @@ def extract_single_image(input_file, stream_index, timestamp, output_path):
     except subprocess.CalledProcessError: return False
 
 def perform_manual_ocr(input_file, stream_index, lang_code, codec_friendly, output_srt, temp_dir):
-    print(f"    ... Processing Stream #{stream_index} ({lang_code}) [{codec_friendly}] via OCR...")
+    log(f"    ... Processing Stream #{stream_index} ({lang_code}) [{codec_friendly}] via OCR...", 1)
     stream_temp_dir = os.path.join(temp_dir, f"stream_{stream_index}")
     if os.path.exists(stream_temp_dir): shutil.rmtree(stream_temp_dir)
     os.makedirs(stream_temp_dir, exist_ok=True)
@@ -153,7 +228,7 @@ def perform_manual_ocr(input_file, stream_index, lang_code, codec_friendly, outp
     packets = extract_subtitle_packets(input_file, stream_index)
     if not packets: return False, "No packets found."
 
-    print(f"    -> Rendering {len(packets)} images (Multithreaded)...")
+    log(f"    -> Rendering {len(packets)} images (Multithreaded)...", 1)
     with ThreadPoolExecutor(max_workers=4) as executor:
         for i, packet in enumerate(packets):
             img = os.path.join(stream_temp_dir, f"img_{i:05d}.tif")
@@ -163,7 +238,7 @@ def perform_manual_ocr(input_file, stream_index, lang_code, codec_friendly, outp
     if not images: return False, "No images extracted."
     
     count = min(len(images), len(packets))
-    print(f"    -> OCRing {count} lines...")
+    log(f"    -> OCRing {count} lines...", 1)
     srt_lines = []
     if lang_code == 'und': lang_code = 'eng'
     
@@ -187,51 +262,40 @@ def perform_manual_ocr(input_file, stream_index, lang_code, codec_friendly, outp
     return True, "Success"
 
 def perform_text_conversion(input_file, stream_index, output_srt):
-    print(f"    ... Converting Stream #{stream_index} (Text-Based) -> SRT...")
+    log(f"    ... Converting Stream #{stream_index} (Text-Based) -> SRT...", 1)
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", input_file, "-map", f"0:{stream_index}", "-c:s", "srt", "-y", output_srt]
     try:
         subprocess.run(cmd, check=True)
         return True
     except subprocess.CalledProcessError as e:
-        print(f"    -> Conversion Failed: {e}")
+        log(f"    -> Conversion Failed: {e}", 1)
         return False
 
 # --- Main Processing Logic ---
 
 def smart_move_file(source, destination):
-    """
-    Moves file using 'pv' for progress if on different filesystems,
-    otherwise uses atomic rename.
-    """
     try:
-        # Check filesystems
         src_dev = os.stat(source).st_dev
         dest_dir = os.path.dirname(os.path.abspath(destination))
         if not os.path.exists(dest_dir): os.makedirs(dest_dir)
         dest_dev = os.stat(dest_dir).st_dev
         
-        # If different devices and pv exists, pipe it
         if src_dev != dest_dev and shutil.which('pv'):
-            print(f"Moving to: {destination} (via pv)...")
+            log(f"Moving to: {destination} (via pv)...", 1)
             size = os.path.getsize(source)
             cmd = f"pv \"{source}\" -s {size} > \"{destination}\""
             subprocess.run(cmd, shell=True, check=True)
             os.remove(source)
             return True
         else:
-            # Same device OR no pv -> Standard Move
-            print(f"Moving to: {destination}...")
+            log(f"Moving to: {destination}...", 1)
             shutil.move(source, destination)
             return True
     except Exception as e:
-        print(f"Error moving file: {e}")
+        log(f"Error moving file: {e}", 1)
         return False
 
 def process_remux(input_path, output_path, subs_list):
-    """
-    subs_list: List of dicts representing the FINAL desired order.
-    Each dict has: { 'original_index': int, 'status': 'KEEP'/'REMOVE'/'CONVERT', ... }
-    """
     os.makedirs(TEMP_DIR, exist_ok=True)
     base_name = os.path.basename(output_path)
     temp_final = os.path.join(TEMP_DIR, f"TEMP_REMUX_{int(time.time())}_{base_name}")
@@ -245,38 +309,47 @@ def process_remux(input_path, output_path, subs_list):
     subs_to_convert = [s for s in subs_list if s['status'] == 'CONVERT']
     
     if subs_to_convert:
-        print("\n--- Starting Conversion Phase ---")
+        log("\n--- Starting Conversion Phase ---", 1)
         has_image_subs = any(not s['is_text'] for s in subs_to_convert)
         if has_image_subs and not shutil.which("tesseract"):
-            print("Error: Tesseract not installed. Cannot convert image-based subs.")
+            log("Error: Tesseract not installed. Cannot convert image-based subs.", 0)
             return
 
         for sub in subs_to_convert:
             idx = sub['original_index']
+            
+            # Determine Input File and Stream Index for Conversion
+            if sub.get('is_external'):
+                # External file conversion
+                conv_input_path = sub['file_path']
+                conv_stream_idx = 0 # Usually 0 for external files
+            else:
+                # Internal stream conversion
+                conv_input_path = input_path
+                conv_stream_idx = idx
+
             srt_path = os.path.join(ocr_work_dir, f"converted_{idx}.srt")
             success = False
             
             if sub['is_text']:
-                success = perform_text_conversion(input_path, idx, srt_path)
+                success = perform_text_conversion(conv_input_path, conv_stream_idx, srt_path)
             else:
-                success, reason = perform_manual_ocr(input_path, idx, sub['lang'], sub['codec_friendly'], srt_path, ocr_work_dir)
+                success, reason = perform_manual_ocr(conv_input_path, conv_stream_idx, sub['lang'], sub['codec_friendly'], srt_path, ocr_work_dir)
                 if not success:
-                    print(f"Warning: OCR Failed for Stream #{idx}. Reason: {reason}")
+                    log(f"Warning: OCR Failed for Stream #{idx}. Reason: {reason}", 1)
                     try:
                         choice = input(f"    How do you want to handle this track? [K]eep Original or [R]emove? [K/r]: ").lower().strip()
                         if choice == 'r':
-                            print(f"    -> Marking Stream #{idx} for REMOVAL.")
+                            log(f"    -> Marking Stream #{idx} for REMOVAL.", 1)
                             sub['status'] = 'REMOVE'
                         else:
-                            print(f"    -> Keeping Stream #{idx} as original.")
+                            log(f"    -> Keeping Stream #{idx} as original.", 1)
                             sub['status'] = 'KEEP'
                     except KeyboardInterrupt:
-                        print("\nCancelled."); return
+                        log("\nCancelled.", 0); return
 
             if success:
-                # Cleaner title logic
                 clean_title = f"{sub['title']} - SRT" if sub['title'] else "SRT"
-                
                 converted_inputs[idx] = {
                     'path': srt_path,
                     'lang': sub['lang'],
@@ -284,14 +357,31 @@ def process_remux(input_path, output_path, subs_list):
                 }
 
     # 2. Build FFmpeg Command
-    print("\n--- Building Final File ---")
+    log("\n--- Building Final File ---", 1)
     cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-stats", "-i", input_path]
     
+    # Track inputs added for external files and conversions
+    # Map original_index -> ffmpeg_input_index
+    # Input 0 is video. 
+    # We need to add EXTERNAL files (marked KEEP) and CONVERTED files.
+    
+    extra_inputs_map = {} # Map 'original_index' -> input_id
+    current_input_id = 1
+    
+    # 2a. Add External Files (KEEP)
+    external_keeps = [s for s in subs_list if s.get('is_external') and s['status'] == 'KEEP']
+    for ext in external_keeps:
+        cmd.extend(["-i", ext['file_path']])
+        extra_inputs_map[ext['original_index']] = current_input_id
+        current_input_id += 1
+        
+    # 2b. Add Converted SRTs
+    # We load them in order of keys
     sorted_conv_indices = sorted(converted_inputs.keys())
-    input_file_map = {}
-    for i, idx in enumerate(sorted_conv_indices):
+    for idx in sorted_conv_indices:
         cmd.extend(["-i", converted_inputs[idx]['path']])
-        input_file_map[idx] = i + 1
+        extra_inputs_map[idx] = current_input_id # Overwrites if external was converted (which is correct, we use new SRT)
+        current_input_id += 1
 
     # Map Video & Audio
     for s in all_streams:
@@ -308,12 +398,25 @@ def process_remux(input_path, output_path, subs_list):
         if status == 'REMOVE': continue
             
         elif status == 'KEEP':
-            cmd.extend(["-map", f"0:{orig_idx}"])
-            current_out_idx += 1
+            if sub.get('is_external'):
+                # Map External Input
+                if orig_idx in extra_inputs_map:
+                    input_idx = extra_inputs_map[orig_idx]
+                    cmd.extend(["-map", f"{input_idx}:0"])
+                    # Apply Metadata
+                    cmd.extend([
+                        f"-metadata:s:s:{current_out_idx}", f"language={sub['lang']}",
+                        f"-metadata:s:s:{current_out_idx}", f"title={sub['title']}"
+                    ])
+                    current_out_idx += 1
+            else:
+                # Internal Keep
+                cmd.extend(["-map", f"0:{orig_idx}"])
+                current_out_idx += 1
             
         elif status == 'CONVERT':
-            if orig_idx in converted_inputs:
-                input_idx = input_file_map[orig_idx]
+            if orig_idx in converted_inputs and orig_idx in extra_inputs_map:
+                input_idx = extra_inputs_map[orig_idx]
                 cmd.extend(["-map", f"{input_idx}:0"])
                 meta = converted_inputs[orig_idx]
                 cmd.extend([
@@ -322,21 +425,25 @@ def process_remux(input_path, output_path, subs_list):
                 ])
                 current_out_idx += 1
             else:
-                # Fallback
-                cmd.extend(["-map", f"0:{orig_idx}"])
-                current_out_idx += 1
+                # Fallback (Conversion failed/cancelled)
+                if not sub.get('is_external'):
+                    cmd.extend(["-map", f"0:{orig_idx}"])
+                    current_out_idx += 1
 
-    # Map Attachments/Data
     cmd.extend(["-map", "0:d?", "-map", "0:t?"])
     cmd.extend(["-c", "copy", "-map_metadata", "0", "-y", temp_final])
+    
+    if VERBOSITY >= 2:
+        log("\nFFmpeg Command:", 2)
+        log(" ".join(cmd), 2)
     
     try:
         subprocess.run(cmd, check=True)
         if os.path.exists(temp_final) and os.path.getsize(temp_final) > 0:
             if smart_move_file(temp_final, output_path):
-                print("Success!")
-        else: print("Error: Output empty.")
-    except subprocess.CalledProcessError as e: print(f"FFmpeg Error: {e}")
+                log("Success!", 1)
+        else: log("Error: Output empty.", 0)
+    except subprocess.CalledProcessError as e: log(f"FFmpeg Error: {e}", 0)
     finally:
         if os.path.exists(ocr_work_dir): shutil.rmtree(ocr_work_dir)
 
@@ -463,22 +570,30 @@ def draw_prompt_popup(stdscr, title, prompt):
         if key in (ord('n'), ord('N'), 27): return False
 
 def init_subtitles(file_path):
+    # 1. Internal Subs
     raw_streams = get_stream_info(file_path)
-    raw_subs = [s for s in raw_streams if s.get('codec_type') == 'subtitle']
-    if not raw_subs: return None
-    
     subtitles = []
-    for s in raw_subs:
-        codec_raw = s.get('codec_name', 'unknown')
-        subtitles.append({
-            'original_index': s['index'],
-            'lang': s.get('tags', {}).get('language', 'und'),
-            'title': s.get('tags', {}).get('title', ''),
-            'codec_raw': codec_raw,
-            'codec_friendly': SUBTITLE_CODEC_MAP.get(codec_raw, codec_raw),
-            'is_text': codec_raw in TEXT_BASED_CODECS,
-            'status': 'KEEP'
-        })
+    
+    if raw_streams:
+        raw_subs = [s for s in raw_streams if s.get('codec_type') == 'subtitle']
+        for s in raw_subs:
+            codec_raw = s.get('codec_name', 'unknown')
+            subtitles.append({
+                'original_index': s['index'],
+                'is_external': False,
+                'lang': s.get('tags', {}).get('language', 'und'),
+                'title': s.get('tags', {}).get('title', ''),
+                'codec_raw': codec_raw,
+                'codec_friendly': SUBTITLE_CODEC_MAP.get(codec_raw, codec_raw),
+                'is_text': codec_raw in TEXT_BASED_CODECS,
+                'status': 'KEEP'
+            })
+    
+    # 2. External Subs
+    external_subs = scan_external_subs(file_path)
+    subtitles.extend(external_subs)
+    
+    if not subtitles: return None
     return subtitles
 
 def tui_main(stdscr, args, file_path, is_batch=False):
@@ -558,7 +673,6 @@ def scan_directory(path, recursive):
     vids = []
     if recursive:
         for root, dirs, files in os.walk(path):
-            # Skip system/metadata dirs
             dirs[:] = [d for d in dirs if d not in ('.trickplay', '.bif', 'Backdrops', 'metadata')]
             for f in files:
                 if f.lower().endswith(VIDEO_EXTS): vids.append(os.path.join(root, f))
@@ -568,43 +682,36 @@ def scan_directory(path, recursive):
     return sorted(vids)
 
 def apply_template_to_file(file_path, template_subs):
-    """
-    Applies logic from template_subs to new file.
-    template_subs contains user desired state (reordered, statuses set).
-    We must map this logic to the new file's tracks.
-    Assumption: New file has identical structure (verified before calling).
-    """
     new_subs = init_subtitles(file_path)
     if not new_subs: return None
     
-    # Map actions by original index position
-    # The template_subs list might be REORDERED.
-    # We need to construct a new list for the current file that matches that reordering and status.
-    
     final_subs = []
-    
-    # Iterate through the template list (which represents the desired output order)
     for template_item in template_subs:
-        # Find the corresponding track in the new file based on original index
-        # Since structure is identical, the track at original_index X in template corresponds to original_index X in new file
         orig_idx = template_item['original_index']
-        
         matching_sub = next((s for s in new_subs if s['original_index'] == orig_idx), None)
-        
         if matching_sub:
-            # Apply status from template
             matching_sub['status'] = template_item['status']
             final_subs.append(matching_sub)
-            
     return final_subs
 
 def main():
+    global VERBOSITY
     parser = argparse.ArgumentParser(description="Interactive Subtitle Tool")
     parser.add_argument("-i", "--input", help="Input video file")
     parser.add_argument("-d", "--dir", help="Input directory (Batch Mode)")
     parser.add_argument("-R", "--recursive", action="store_true", help="Recursive scan (for -d)")
     parser.add_argument("-v", "--version", action="store_true", help="Show history")
+    
+    parser.add_argument("-q", "--quiet", action="store_true", help="Quiet Mode")
+    parser.add_argument("-V", "--verbose", action="store_true", default=True, help="Verbose Mode (Default)")
+    parser.add_argument("-VV", "--very-verbose", action="store_true", help="Debug Mode (Show FFmpeg commands)")
+    
     args = parser.parse_args()
+
+    # Set Global Verbosity
+    if args.quiet: VERBOSITY = 0
+    elif args.very_verbose: VERBOSITY = 2
+    else: VERBOSITY = 1
 
     print_version()
     if args.version: print(VERSION_HISTORY); sys.exit(0)
@@ -612,14 +719,14 @@ def main():
     files_to_process = []
     if args.input:
         if os.path.exists(args.input): files_to_process = [args.input]
-        else: print("Error: File not found."); sys.exit(1)
+        else: log("Error: File not found.", 0); sys.exit(1)
     elif args.dir:
         if os.path.exists(args.dir):
             files_to_process = scan_directory(args.dir, args.recursive)
-            if not files_to_process: print("No video files found in directory."); sys.exit(0)
-        else: print("Error: Directory not found."); sys.exit(1)
+            if not files_to_process: log("No video files found in directory.", 0); sys.exit(0)
+        else: log("Error: Directory not found.", 0); sys.exit(1)
     else:
-        print("Error: -i or -d required."); sys.exit(1)
+        log("Error: -i or -d required.", 0); sys.exit(1)
 
     # Batch State
     apply_all_mode = False
@@ -627,28 +734,33 @@ def main():
     template_subs_config = []
 
     for idx, fpath in enumerate(files_to_process):
-        print(f"\nProcessing {idx+1}/{len(files_to_process)}: {os.path.basename(fpath)}")
+        log(f"\nProcessing {idx+1}/{len(files_to_process)}: {os.path.basename(fpath)}", 1)
         
         # Check if we can apply template
         if apply_all_mode:
             current_sig = get_track_structure_signature(fpath)
             if current_sig == template_signature:
-                print("  -> Applying template settings...")
+                log("  -> Applying template settings...", 1)
                 subs_list = apply_template_to_file(fpath, template_subs_config)
                 process_remux(fpath, fpath, subs_list)
                 continue
             else:
-                print("  -> Structure mismatch! Falling back to interactive mode.")
-                time.sleep(1) # Let user see message
+                log("  -> Structure mismatch! Falling back to interactive mode.", 1)
+                time.sleep(1)
 
         # Interactive Mode
         try:
-            # Pass is_batch flag to enable 'Apply to All' in UI
             res = curses.wrapper(tui_main, args, fpath, is_batch=(len(files_to_process) > 1))
-        except KeyboardInterrupt: print("\nCancelled."); sys.exit(0)
+        except KeyboardInterrupt: log("\nCancelled.", 0); sys.exit(0)
         
         if not res: 
-            print("Skipped/Quit."); 
+            # Check why it failed (no subs vs user quit)
+            subtitles = init_subtitles(fpath)
+            if not subtitles:
+                log("  -> Skipped (No subtitles found).", 1)
+            else:
+                log("  -> Skipped/Quit by user.", 1)
+            
             if len(files_to_process) == 1: sys.exit(0)
             continue
             
@@ -657,8 +769,8 @@ def main():
         if confirmation == 'A':
             apply_all_mode = True
             template_signature = get_track_structure_signature(fpath)
-            template_subs_config = subs_list # Save the reordered/configured list
-            print("  -> Template saved. Applying to remaining files...")
+            template_subs_config = subs_list
+            log("  -> Template saved. Applying to remaining files...", 1)
             
         process_remux(fpath, out_path, subs_list)
 
