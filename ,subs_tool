@@ -24,19 +24,18 @@ from concurrent.futures import ThreadPoolExecutor
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "2.7.0"
+VERSION = "2.7.1"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v2.7.1 feat(ui): OCR Warning & Highlighting
+        - Added conspicuous highlighting (BOLD) for [IMG] based subtitle tracks.
+        - Changed 'C' key to toggle conversion for the CURRENT track only.
+        - Added a warning popup when attempting to convert [IMG] tracks via OCR.
+
 v2.7.0 feat(core): External Subtitle Support
         - Scans for sidecar subtitle files (.srt, .sub, .ass, etc.)
-        - Displays external subs in the list (marked [EXTERNAL]).
-        - Allows Keeping (Embedding), Removing (Ignoring), or Converting external subs.
-        - Supports converting external VobSub (.sub/.idx) to internal SRT.
-
-v2.6.0 feat(core): Verbosity Controls
-        - Added -V/--verbose (default), -VV/--very-verbose, -q/--quiet.
 """
 
 # --- Constants & Mappings ---
@@ -485,6 +484,11 @@ def draw_menu(stdscr, filename, subtitles, output_path, cursor_pos, edit_mode, m
             color = curses.color_pair(3); check = "[C] CONVERT"
             
         style = color
+        
+        # Highlight IMG subs in list
+        if not sub['is_text'] and status == 'KEEP':
+            style |= curses.A_BOLD
+
         if idx_in_list == cursor_pos and not edit_mode:
             if move_mode:
                 style = curses.color_pair(4) | curses.A_BOLD
@@ -652,13 +656,17 @@ def tui_main(stdscr, args, file_path, is_batch=False):
                 if s['lang'] != 'eng': s['status'] = 'REMOVE'
                 
         elif key in (ord('c'), ord('C')): 
-            include_text = False
-            has_text = any(s['is_text'] for s in subtitles)
-            if has_text:
-                if draw_prompt_popup(stdscr, "Convert Options", "Include text-based subs?"): include_text = True
-            for s in subtitles:
-                if not s['is_text']: s['status'] = 'CONVERT'
-                elif include_text and s['codec_raw'] != 'subrip': s['status'] = 'CONVERT'
+            # Toggle Convert for CURRENT track only
+            sub = subtitles[cursor_pos]
+            if sub['status'] == 'CONVERT':
+                sub['status'] = 'KEEP'
+            else:
+                if not sub['is_text']:
+                    if draw_prompt_popup(stdscr, "OCR WARNING", "Image-based sub. OCR is unreliable/slow. Proceed?"):
+                        sub['status'] = 'CONVERT'
+                else:
+                    if sub['codec_raw'] != 'subrip': # No point converting SRT to SRT
+                        sub['status'] = 'CONVERT'
         
         elif key in (ord('m'), ord('M')): move_mode = True
         elif key in (ord('o'), ord('O')): edit_mode = True; curses.curs_set(1)
