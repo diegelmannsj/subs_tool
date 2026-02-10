@@ -21,11 +21,13 @@ import time
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "3.0.0"
+VERSION = "3.0.2"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v3.0.2 feat(cli): Positional path argument (detects file vs dir)
+v3.0.1 feat(ui): Show full path in header
 v3.0.0 refactor(core): Remove OCR & Slim Down
         - REMOVED unreliable manual OCR pipeline (Tesseract/Image extraction).
         - [C]onvert now exclusively handles text-to-text conversion (ASS/SSA -> SRT).
@@ -157,6 +159,7 @@ def scan_external_subs(video_path):
 
 def perform_text_conversion(input_file, stream_index, output_srt):
     log(f"    ... Converting Stream #{stream_index} (Text-Based) -> SRT...", 1)
+    # Using default FFmpeg copy/conversion; specific QSV instructions applied if transcoding video
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", input_file, "-map", f"0:{stream_index}", "-c:s", "srt", "-y", output_srt]
     try:
         subprocess.run(cmd, check=True)
@@ -218,7 +221,6 @@ def process_remux(input_path, output_path, subs_list):
             if sub['is_text']:
                 success = perform_text_conversion(conv_input_path, conv_stream_idx, srt_path)
             else:
-                # Should be caught by UI, but double check
                 log(f"Warning: Skipping image-based stream #{idx}. OCR removed.", 1)
                 sub['status'] = 'KEEP'
 
@@ -298,10 +300,10 @@ def process_remux(input_path, output_path, subs_list):
 
 # --- TUI Functions ---
 
-def draw_menu(stdscr, filename, subtitles, output_path, cursor_pos, edit_mode, move_mode):
+def draw_menu(stdscr, full_path, subtitles, output_path, cursor_pos, edit_mode, move_mode):
     stdscr.clear()
     h, w = stdscr.getmaxyx()
-    header = f",subs_tool v{VERSION} - {filename}"
+    header = f",subs_tool v{VERSION} - {full_path}"
     stdscr.addstr(0, 0, header[:w-1], curses.A_BOLD | curses.A_UNDERLINE)
     
     if move_mode:
@@ -422,7 +424,6 @@ def draw_prompt_popup(stdscr, title, prompt):
         if key in (ord('n'), ord('N'), 27): return False
 
 def init_subtitles(file_path):
-    # 1. Internal Subs
     raw_streams = get_stream_info(file_path)
     subtitles = []
     
@@ -441,7 +442,6 @@ def init_subtitles(file_path):
                 'status': 'KEEP'
             })
     
-    # 2. External Subs
     external_subs = scan_external_subs(file_path)
     subtitles.extend(external_subs)
     
@@ -460,7 +460,7 @@ def tui_main(stdscr, args, file_path, is_batch=False):
     curses.curs_set(0)
     stdscr.timeout(100)
     
-    filename = os.path.basename(file_path)
+    full_path = os.path.abspath(file_path)
     output_path = file_path
     
     subtitles = init_subtitles(file_path)
@@ -471,30 +471,23 @@ def tui_main(stdscr, args, file_path, is_batch=False):
     move_mode = False
     
     while True:
-        draw_menu(stdscr, filename, subtitles, output_path, cursor_pos, edit_mode, move_mode)
+        draw_menu(stdscr, full_path, subtitles, output_path, cursor_pos, edit_mode, move_mode)
         key = stdscr.getch()
         
         if key == curses.KEY_MOUSE:
             try:
                 _, mx, my, _, _ = curses.getmouse()
-                # Handle List Clicks (y start = 3)
                 list_start_y = 3
                 max_visible = stdscr.getmaxyx()[0] - 6
                 
-                # Check if click is within list area
                 if list_start_y <= my < list_start_y + max_visible:
-                    # Calculate index
                     scroll_offset = max(0, cursor_pos - max_visible + 1)
                     clicked_row = my - list_start_y
                     actual_idx = clicked_row + scroll_offset
                     
                     if 0 <= actual_idx < len(subtitles):
-                        # Move cursor to clicked item
                         cursor_pos = actual_idx
-                        # Toggle status (if not in move mode)
                         if not move_mode:
-                            # Logic: KEEP -> REMOVE -> CONVERT (if text) -> KEEP
-                            # If image: KEEP -> REMOVE -> KEEP
                             sub = subtitles[cursor_pos]
                             curr = sub['status']
                             
@@ -508,7 +501,6 @@ def tui_main(stdscr, args, file_path, is_batch=False):
                             elif curr == 'CONVERT':
                                 sub['status'] = 'KEEP'
                                 
-                # Check if click is on Output Path (h-2)
                 h, _ = stdscr.getmaxyx()
                 if my == h - 2:
                     edit_mode = True
@@ -547,17 +539,12 @@ def tui_main(stdscr, args, file_path, is_batch=False):
                 if s['lang'] != 'eng': s['status'] = 'REMOVE'
                 
         elif key in (ord('c'), ord('C')): 
-            # Toggle Convert for CURRENT track only
             sub = subtitles[cursor_pos]
             if sub['status'] == 'CONVERT':
                 sub['status'] = 'KEEP'
             else:
-                if not sub['is_text']:
-                    # Block image conversion
-                    pass
-                else:
-                    if sub['codec_raw'] != 'subrip': # No point converting SRT to SRT
-                        sub['status'] = 'CONVERT'
+                if sub['is_text'] and sub['codec_raw'] != 'subrip':
+                    sub['status'] = 'CONVERT'
         
         elif key in (ord('m'), ord('M')): move_mode = True
         elif key in (ord('o'), ord('O')): edit_mode = True; curses.curs_set(1)
@@ -571,7 +558,7 @@ def tui_main(stdscr, args, file_path, is_batch=False):
 def scan_directory(path, recursive):
     vids = []
     if recursive:
-        for root, dirs, files in os.walk(path):
+        for root, dirs, files in os.path.walk(path):
             dirs[:] = [d for d in dirs if d not in ('.trickplay', '.bif', 'Backdrops', 'metadata')]
             for f in files:
                 if f.lower().endswith(VIDEO_EXTS): vids.append(os.path.join(root, f))
@@ -596,6 +583,9 @@ def apply_template_to_file(file_path, template_subs):
 def main():
     global VERBOSITY
     parser = argparse.ArgumentParser(description="Interactive Subtitle Tool")
+    # Positional argument for shorthand usage
+    parser.add_argument("path", nargs="?", help="Input file or directory (shorthand for -i or -d)")
+    
     parser.add_argument("-i", "--input", help="Input video file")
     parser.add_argument("-d", "--dir", help="Input directory (Batch Mode)")
     parser.add_argument("-R", "--recursive", action="store_true", help="Recursive scan (for -d)")
@@ -607,12 +597,20 @@ def main():
     
     args = parser.parse_args()
 
-    # Set Global Verbosity
+    # Print version as instructed (first thing)
+    print_version()
+
+    # Smart path detection for positional argument if flags are missing
+    if args.path and not args.input and not args.dir:
+        if os.path.isdir(args.path):
+            args.dir = args.path
+        else:
+            args.input = args.path
+
     if args.quiet: VERBOSITY = 0
     elif args.very_verbose: VERBOSITY = 2
     else: VERBOSITY = 1
 
-    print_version()
     if args.version: print(VERSION_HISTORY); sys.exit(0)
     
     files_to_process = []
@@ -625,9 +623,8 @@ def main():
             if not files_to_process: log("No video files found in directory.", 0); sys.exit(0)
         else: log("Error: Directory not found.", 0); sys.exit(1)
     else:
-        log("Error: -i or -d required.", 0); sys.exit(1)
+        log("Error: -i, -d, or positional path required.", 0); sys.exit(1)
 
-    # Batch State
     apply_all_mode = False
     template_signature = ""
     template_subs_config = []
@@ -635,7 +632,6 @@ def main():
     for idx, fpath in enumerate(files_to_process):
         log(f"\nProcessing {idx+1}/{len(files_to_process)}: {os.path.basename(fpath)}", 1)
         
-        # Check if we can apply template
         if apply_all_mode:
             current_sig = get_track_structure_signature(fpath)
             if current_sig == template_signature:
@@ -647,13 +643,11 @@ def main():
                 log("  -> Structure mismatch! Falling back to interactive mode.", 1)
                 time.sleep(1)
 
-        # Interactive Mode
         try:
             res = curses.wrapper(tui_main, args, fpath, is_batch=(len(files_to_process) > 1))
         except KeyboardInterrupt: log("\nCancelled.", 0); sys.exit(0)
         
         if not res: 
-            # Check why it failed (no subs vs user quit)
             subtitles = init_subtitles(fpath)
             if not subtitles:
                 log("  -> Skipped (No subtitles found).", 1)
