@@ -21,11 +21,12 @@ import time
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "3.0.2"
+VERSION = "3.1.0"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v3.1.0 feat(tui): Next/Prev file navigation via Left/Right arrows
 v3.0.2 feat(cli): Positional path argument (detects file vs dir)
 v3.0.1 feat(ui): Show full path in header
 v3.0.0 refactor(core): Remove OCR & Slim Down
@@ -300,17 +301,20 @@ def process_remux(input_path, output_path, subs_list):
 
 # --- TUI Functions ---
 
-def draw_menu(stdscr, full_path, subtitles, output_path, cursor_pos, edit_mode, move_mode):
+def draw_menu(stdscr, full_path, subtitles, output_path, cursor_pos, edit_mode, move_mode, is_batch=False, file_idx=0, total_files=0):
     stdscr.clear()
     h, w = stdscr.getmaxyx()
-    header = f",subs_tool v{VERSION} - {full_path}"
+    
+    counter = f"[{file_idx+1}/{total_files}] " if is_batch else ""
+    header = f",subs_tool v{VERSION} - {counter}{full_path}"
     stdscr.addstr(0, 0, header[:w-1], curses.A_BOLD | curses.A_UNDERLINE)
     
     if move_mode:
         instr = "[UP/DOWN] Move Track | [M] Exit Move Mode"
         color = curses.color_pair(4)
     else:
-        instr = "[Space/Click] Toggle | [M] Move | [A] No-Eng | [C] Convert | [R] Run | [Q] Quit"
+        nav_hint = " | [L/R Arrows] Skip File" if is_batch else ""
+        instr = f"[Space/Click] Toggle | [M] Move | [A] No-Eng | [C] Convert | [R] Run | [Q] Quit{nav_hint}"
         color = curses.A_DIM
         
     stdscr.addstr(1, 0, instr[:w-1], color)
@@ -448,7 +452,7 @@ def init_subtitles(file_path):
     if not subtitles: return None
     return subtitles
 
-def tui_main(stdscr, args, file_path, is_batch=False):
+def tui_main(stdscr, args, file_path, is_batch=False, file_idx=0, total_files=0):
     curses.start_color()
     curses.use_default_colors()
     curses.init_pair(1, curses.COLOR_RED, -1)    # Remove
@@ -471,7 +475,7 @@ def tui_main(stdscr, args, file_path, is_batch=False):
     move_mode = False
     
     while True:
-        draw_menu(stdscr, full_path, subtitles, output_path, cursor_pos, edit_mode, move_mode)
+        draw_menu(stdscr, full_path, subtitles, output_path, cursor_pos, edit_mode, move_mode, is_batch, file_idx, total_files)
         key = stdscr.getch()
         
         if key == curses.KEY_MOUSE:
@@ -528,6 +532,10 @@ def tui_main(stdscr, args, file_path, is_batch=False):
         elif key == curses.KEY_UP: cursor_pos = max(0, cursor_pos - 1)
         elif key == curses.KEY_DOWN: cursor_pos = min(len(subtitles)-1, cursor_pos + 1)
         
+        # Batch Navigation
+        elif key == curses.KEY_RIGHT and is_batch: return "__NAV_NEXT__", None, None
+        elif key == curses.KEY_LEFT and is_batch: return "__NAV_PREV__", None, None
+
         elif key == ord(' '): 
             curr = subtitles[cursor_pos]['status']
             if curr == 'KEEP': subtitles[cursor_pos]['status'] = 'REMOVE'
@@ -558,7 +566,7 @@ def tui_main(stdscr, args, file_path, is_batch=False):
 def scan_directory(path, recursive):
     vids = []
     if recursive:
-        for root, dirs, files in os.path.walk(path):
+        for root, dirs, files in os.walk(path):
             dirs[:] = [d for d in dirs if d not in ('.trickplay', '.bif', 'Backdrops', 'metadata')]
             for f in files:
                 if f.lower().endswith(VIDEO_EXTS): vids.append(os.path.join(root, f))
@@ -583,7 +591,6 @@ def apply_template_to_file(file_path, template_subs):
 def main():
     global VERBOSITY
     parser = argparse.ArgumentParser(description="Interactive Subtitle Tool")
-    # Positional argument for shorthand usage
     parser.add_argument("path", nargs="?", help="Input file or directory (shorthand for -i or -d)")
     
     parser.add_argument("-i", "--input", help="Input video file")
@@ -600,7 +607,7 @@ def main():
     # Print version as instructed (first thing)
     print_version()
 
-    # Smart path detection for positional argument if flags are missing
+    # Smart path detection
     if args.path and not args.input and not args.dir:
         if os.path.isdir(args.path):
             args.dir = args.path
@@ -629,8 +636,11 @@ def main():
     template_signature = ""
     template_subs_config = []
 
-    for idx, fpath in enumerate(files_to_process):
-        log(f"\nProcessing {idx+1}/{len(files_to_process)}: {os.path.basename(fpath)}", 1)
+    # Use index-based loop to support backward/forward navigation
+    f_idx = 0
+    while f_idx < len(files_to_process):
+        fpath = files_to_process[f_idx]
+        log(f"\nProcessing {f_idx+1}/{len(files_to_process)}: {os.path.basename(fpath)}", 1)
         
         if apply_all_mode:
             current_sig = get_track_structure_signature(fpath)
@@ -638,15 +648,24 @@ def main():
                 log("  -> Applying template settings...", 1)
                 subs_list = apply_template_to_file(fpath, template_subs_config)
                 process_remux(fpath, fpath, subs_list)
+                f_idx += 1
                 continue
             else:
                 log("  -> Structure mismatch! Falling back to interactive mode.", 1)
                 time.sleep(1)
 
         try:
-            res = curses.wrapper(tui_main, args, fpath, is_batch=(len(files_to_process) > 1))
+            res = curses.wrapper(tui_main, args, fpath, is_batch=(len(files_to_process) > 1), file_idx=f_idx, total_files=len(files_to_process))
         except KeyboardInterrupt: log("\nCancelled.", 0); sys.exit(0)
         
+        # Navigation signals
+        if res and res[0] == "__NAV_NEXT__":
+            f_idx += 1
+            continue
+        if res and res[0] == "__NAV_PREV__":
+            f_idx = max(0, f_idx - 1)
+            continue
+
         if not res: 
             subtitles = init_subtitles(fpath)
             if not subtitles:
@@ -655,6 +674,7 @@ def main():
                 log("  -> Skipped/Quit by user.", 1)
             
             if len(files_to_process) == 1: sys.exit(0)
+            f_idx += 1
             continue
             
         out_path, subs_list, confirmation = res
@@ -666,6 +686,7 @@ def main():
             log("  -> Template saved. Applying to remaining files...", 1)
             
         process_remux(fpath, out_path, subs_list)
+        f_idx += 1
 
 if __name__ == "__main__":
     main()
