@@ -21,11 +21,12 @@ import time
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "3.1.0"
+VERSION = "3.1.1"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v3.1.1 feat(core): Pre-screen batch files to skip those without subtitles
 v3.1.0 feat(tui): Next/Prev file navigation via Left/Right arrows
 v3.0.2 feat(cli): Positional path argument (detects file vs dir)
 v3.0.1 feat(ui): Show full path in header
@@ -620,17 +621,35 @@ def main():
 
     if args.version: print(VERSION_HISTORY); sys.exit(0)
     
-    files_to_process = []
+    files_found = []
     if args.input:
-        if os.path.exists(args.input): files_to_process = [args.input]
+        if os.path.exists(args.input): files_found = [args.input]
         else: log("Error: File not found.", 0); sys.exit(1)
     elif args.dir:
         if os.path.exists(args.dir):
-            files_to_process = scan_directory(args.dir, args.recursive)
-            if not files_to_process: log("No video files found in directory.", 0); sys.exit(0)
+            files_found = scan_directory(args.dir, args.recursive)
+            if not files_found: log("No video files found in directory.", 0); sys.exit(0)
         else: log("Error: Directory not found.", 0); sys.exit(1)
     else:
         log("Error: -i, -d, or positional path required.", 0); sys.exit(1)
+
+    # Pre-screening (Batch Mode Only)
+    files_to_process = []
+    if len(files_found) > 1:
+        log(f"Screening {len(files_found)} files for subtitle tracks...", 1)
+        for f in files_found:
+            if init_subtitles(f):
+                files_to_process.append(f)
+        
+        skipped = len(files_found) - len(files_to_process)
+        if skipped > 0:
+            log(f"  -> Found {len(files_to_process)} files with tracks ({skipped} skipped).", 1)
+            
+        if not files_to_process:
+            log("No files with subtitles found. Exiting.", 0)
+            sys.exit(0)
+    else:
+        files_to_process = files_found
 
     apply_all_mode = False
     template_signature = ""
@@ -659,10 +678,10 @@ def main():
         except KeyboardInterrupt: log("\nCancelled.", 0); sys.exit(0)
         
         # Navigation signals
-        if res and res[0] == "__NAV_NEXT__":
+        if res and isinstance(res, tuple) and res[0] == "__NAV_NEXT__":
             f_idx += 1
             continue
-        if res and res[0] == "__NAV_PREV__":
+        if res and isinstance(res, tuple) and res[0] == "__NAV_PREV__":
             f_idx = max(0, f_idx - 1)
             continue
 
