@@ -22,11 +22,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "3.2.0"
+VERSION = "3.2.1"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v3.2.1 ui(tui): Highlight ideal conversion candidates (Non-SRT Text) in Magenta
 v3.2.0 feat(batch): Parallel screening, session persistence, and boundary flash
 v3.1.1 feat(core): Pre-screen batch files to skip those without subtitles
 v3.1.0 feat(tui): Next/Prev file navigation via Left/Right arrows
@@ -152,6 +153,7 @@ def scan_external_subs(video_path):
 
 def perform_text_conversion(input_file, stream_index, output_srt):
     log(f"    ... Converting Stream #{stream_index} (Text-Based) -> SRT...", 1)
+    # Machine has QSV, but subtitle conversion is CPU-bound text processing; no QSV encoder for subtitles exists.
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", input_file, "-map", f"0:{stream_index}", "-c:s", "srt", "-y", output_srt]
     try:
         subprocess.run(cmd, check=True)
@@ -217,6 +219,7 @@ def process_remux(input_path, output_path, subs_list):
                 converted_inputs[idx] = {'path': srt_path, 'lang': sub['lang'], 'title': clean_title}
 
     log("\n--- Building Final File ---", 1)
+    # مشین ہیز QSV (Machine has QSV); however, remuxing (-c copy) does not use it.
     cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-stats", "-i", input_path]
     
     sorted_conv_indices = sorted(converted_inputs.keys())
@@ -312,15 +315,21 @@ def draw_menu(stdscr, full_path, subtitles, output_path, cursor_pos, edit_mode, 
         label = format_track_label(sub)
         status = sub['status']
         
+        # Identification of "Ideal Candidates" (Text but not SRT)
+        is_ideal_candidate = sub['is_text'] and sub['codec_raw'] != 'subrip'
+        
         color = curses.color_pair(2) # Green KEEP
         check = "[ ] KEEP   "
         if status == 'REMOVE':
             color = curses.color_pair(1); check = "[*] REMOVE "
         elif status == 'CONVERT':
             color = curses.color_pair(3); check = "[C] CONVERT"
+        elif is_ideal_candidate and status == 'KEEP':
+            # Conspicuous highlight for optimal conversion candidates currently set to KEEP
+            color = curses.color_pair(5); check = "[!] KEEP* "
             
         style = color
-        if not sub['is_text'] and status == 'KEEP':
+        if (not sub['is_text'] or is_ideal_candidate) and status != 'REMOVE':
             style |= curses.A_BOLD
 
         if idx_in_list == cursor_pos and not edit_mode:
@@ -424,6 +433,7 @@ def tui_main(stdscr, args, file_path, initial_subtitles=None, is_batch=False, fi
     curses.init_pair(2, curses.COLOR_GREEN, -1)  # Keep
     curses.init_pair(3, curses.COLOR_CYAN, -1)   # Convert
     curses.init_pair(4, curses.COLOR_YELLOW, -1) # Moving
+    curses.init_pair(5, curses.COLOR_MAGENTA, -1) # Ideal Candidate Highlight
     curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
     
     curses.curs_set(0)
