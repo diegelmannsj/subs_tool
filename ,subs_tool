@@ -18,15 +18,17 @@ import sys
 import os
 import shutil
 import time
+import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "3.3.0"
+VERSION = "3.4.0"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v3.4.0 feat(ui): Scrub 'External' from embedded track titles and add explicit [EMBEDDED] indicator
 v3.3.0 feat(ext): Track-level EMBED status and [D] global toggle to auto-delete external subs
 v3.2.1 ui(tui): Highlight ideal conversion candidates (Non-SRT Text) in Magenta
 v3.2.0 feat(batch): Parallel screening, session persistence, and boundary flash
@@ -112,7 +114,7 @@ def format_track_label(sub_dict):
     if sub_dict.get('is_external'):
         return f"[EXTERNAL] {lang_name} [{codec}] {type_tag} ({os.path.basename(sub_dict['file_path'])})"
     
-    return f"Stream #{sub_dict['original_index']}: {lang_name} [{sub_dict['lang']}] [{codec}] {type_tag}{title_str}"
+    return f"Stream #{sub_dict['original_index']} [EMBEDDED]: {lang_name} [{sub_dict['lang']}] [{codec}] {type_tag}{title_str}"
 
 def scan_external_subs(video_path):
     base_dir = os.path.dirname(video_path)
@@ -425,11 +427,16 @@ def init_subtitles(file_path):
         raw_subs = [s for s in raw_streams if s.get('codec_type') == 'subtitle']
         for s in raw_subs:
             codec_raw = s.get('codec_name', 'unknown')
+            raw_title = s.get('tags', {}).get('title', '')
+            
+            # Scrub 'External' (and surrounding hyphens/spaces) from embedded titles
+            clean_title = re.sub(r'(?i)[-\s]*\bexternal\b[-\s]*', ' ', raw_title).strip(' -_')
+            
             subtitles.append({
                 'original_index': s['index'],
                 'is_external': False,
                 'lang': s.get('tags', {}).get('language', 'und'),
-                'title': s.get('tags', {}).get('title', ''),
+                'title': clean_title,
                 'codec_raw': codec_raw,
                 'codec_friendly': SUBTITLE_CODEC_MAP.get(codec_raw, codec_raw),
                 'is_text': codec_raw in TEXT_BASED_CODECS,
