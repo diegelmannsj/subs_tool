@@ -2,9 +2,9 @@
 """
 ,subs_tool - Interactive Subtitle Manager
 
-A TUI tool to manually select, remove, convert, and reorder subtitle tracks.
-Features fast conversion for text-based subs (ASS/SSA -> SRT).
-Note: Image-based OCR (PGS/VobSub) has been removed for stability.
+A TUI tool to manually select, remove, convert, embed, and reorder subtitle tracks.
+Features fast conversion for text-based subs (ASS/SSA -> SRT) and auto-deletion
+of external subtitles upon successful muxing.
 
 Author: Buzzy's Admin
 Target System: Fedora Linux (buzzy)
@@ -22,11 +22,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "3.2.1"
+VERSION = "3.3.0"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v3.3.0 feat(ext): Track-level EMBED status and [D] global toggle to auto-delete external subs
 v3.2.1 ui(tui): Highlight ideal conversion candidates (Non-SRT Text) in Magenta
 v3.2.0 feat(batch): Parallel screening, session persistence, and boundary flash
 v3.1.1 feat(core): Pre-screen batch files to skip those without subtitles
@@ -230,7 +231,8 @@ def process_remux(input_path, output_path, subs_list):
 
     extra_inputs_map = {}
     current_input_id = len(converted_inputs) + 1
-    external_keeps = [s for s in subs_list if s.get('is_external') and s['status'] == 'KEEP']
+    # Both KEEP and EMBED status for external files will be mapped in
+    external_keeps = [s for s in subs_list if s.get('is_external') and s['status'] in ('KEEP', 'EMBED')]
     for ext in external_keeps:
         cmd.extend(["-i", ext['file_path']])
         extra_inputs_map[ext['original_index']] = current_input_id
@@ -247,7 +249,7 @@ def process_remux(input_path, output_path, subs_list):
         orig_idx = sub['original_index']
         
         if status == 'REMOVE': continue
-        elif status == 'KEEP':
+        elif status in ('KEEP', 'EMBED'):
             if sub.get('is_external'):
                 if orig_idx in extra_inputs_map:
                     input_idx = extra_inputs_map[orig_idx]
@@ -275,8 +277,17 @@ def process_remux(input_path, output_path, subs_list):
     try:
         subprocess.run(cmd, check=True)
         if os.path.exists(temp_final) and os.path.getsize(temp_final) > 0:
-            smart_move_file(temp_final, output_path)
-            log("Success!", 1)
+            if smart_move_file(temp_final, output_path):
+                log("Success!", 1)
+                
+                # Auto-cleanup for EMBED files after successful move
+                for ext in external_keeps:
+                    if ext['status'] == 'EMBED':
+                        try:
+                            os.remove(ext['file_path'])
+                            log(f"Cleaned up external sub: {ext['file_path']}", 1)
+                        except OSError as e:
+                            log(f"Warning: Failed to delete {ext['file_path']}: {e}", 0)
         else: log("Error: Output empty.", 0)
     except subprocess.CalledProcessError as e: log(f"FFmpeg Error: {e}", 0)
     finally:
@@ -284,7 +295,7 @@ def process_remux(input_path, output_path, subs_list):
 
 # --- TUI Functions ---
 
-def draw_menu(stdscr, full_path, subtitles, output_path, cursor_pos, edit_mode, move_mode, is_batch=False, file_idx=0, total_files=0):
+def draw_menu(stdscr, full_path, subtitles, output_path, cursor_pos, edit_mode, move_mode, is_batch=False, file_idx=0, total_files=0, auto_del_ext=False):
     stdscr.clear()
     h, w = stdscr.getmaxyx()
     
@@ -297,7 +308,8 @@ def draw_menu(stdscr, full_path, subtitles, output_path, cursor_pos, edit_mode, 
         color = curses.color_pair(4)
     else:
         nav_hint = " | [L/R Arrows] Skip File" if is_batch else ""
-        instr = f"[Space/Click] Toggle | [M] Move | [A] No-Eng | [C] Convert | [R] Run | [Q] Quit{nav_hint}"
+        del_state = "ON" if auto_del_ext else "OFF"
+        instr = f"[Space/Click] Toggle | [D] Auto-Del: {del_state} | [M] Move | [C] Convert | [R] Run | [Q] Quit{nav_hint}"
         color = curses.A_DIM
         
     stdscr.addstr(1, 0, instr[:w-1], color)
@@ -324,6 +336,8 @@ def draw_menu(stdscr, full_path, subtitles, output_path, cursor_pos, edit_mode, 
             color = curses.color_pair(1); check = "[*] REMOVE "
         elif status == 'CONVERT':
             color = curses.color_pair(3); check = "[C] CONVERT"
+        elif status == 'EMBED':
+            color = curses.color_pair(6); check = "[E] EMBED  "
         elif is_ideal_candidate and status == 'KEEP':
             # Conspicuous highlight for optimal conversion candidates currently set to KEEP
             color = curses.color_pair(5); check = "[!] KEEP* "
@@ -387,6 +401,8 @@ def draw_confirmation_popup(stdscr, subtitles, is_batch=False):
             attr = curses.color_pair(2)
             if sub['status'] == 'CONVERT':
                 codec = "SRT"; note = " (Converted)"; attr = curses.color_pair(3)
+            elif sub['status'] == 'EMBED':
+                note = " (Embed & Del)"; attr = curses.color_pair(6)
             line = f"{prefix}{lang_name} [{codec}]{note}"
             win.addstr(2+i, 2, line[:box_w-4].ljust(box_w-4), attr)
         
@@ -426,7 +442,7 @@ def init_subtitles(file_path):
     if not subtitles: return None
     return subtitles
 
-def tui_main(stdscr, args, file_path, initial_subtitles=None, is_batch=False, file_idx=0, total_files=0):
+def tui_main(stdscr, args, file_path, initial_subtitles=None, is_batch=False, file_idx=0, total_files=0, auto_del_ext=False):
     curses.start_color()
     curses.use_default_colors()
     curses.init_pair(1, curses.COLOR_RED, -1)    # Remove
@@ -434,6 +450,7 @@ def tui_main(stdscr, args, file_path, initial_subtitles=None, is_batch=False, fi
     curses.init_pair(3, curses.COLOR_CYAN, -1)   # Convert
     curses.init_pair(4, curses.COLOR_YELLOW, -1) # Moving
     curses.init_pair(5, curses.COLOR_MAGENTA, -1) # Ideal Candidate Highlight
+    curses.init_pair(6, curses.COLOR_YELLOW, -1) # Embed External Highlight
     curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
     
     curses.curs_set(0)
@@ -446,12 +463,18 @@ def tui_main(stdscr, args, file_path, initial_subtitles=None, is_batch=False, fi
     subtitles = initial_subtitles if initial_subtitles else init_subtitles(file_path)
     if not subtitles: return None
     
+    # Apply global auto_del_ext if this is a fresh load and flag is true
+    if not initial_subtitles and auto_del_ext:
+        for s in subtitles:
+            if s.get('is_external') and s['status'] == 'KEEP':
+                s['status'] = 'EMBED'
+    
     cursor_pos = 0
     edit_mode = False
     move_mode = False
     
     while True:
-        draw_menu(stdscr, full_path, subtitles, output_path, cursor_pos, edit_mode, move_mode, is_batch, file_idx, total_files)
+        draw_menu(stdscr, full_path, subtitles, output_path, cursor_pos, edit_mode, move_mode, is_batch, file_idx, total_files, auto_del_ext)
         key = stdscr.getch()
         
         if key == curses.KEY_MOUSE:
@@ -466,11 +489,16 @@ def tui_main(stdscr, args, file_path, initial_subtitles=None, is_batch=False, fi
                         cursor_pos = actual_idx
                         if not move_mode:
                             sub = subtitles[cursor_pos]
-                            if sub['status'] == 'KEEP': sub['status'] = 'REMOVE'
-                            elif sub['status'] == 'REMOVE':
-                                if sub['is_text'] and sub['codec_raw'] != 'subrip': sub['status'] = 'CONVERT'
+                            if sub.get('is_external'):
+                                if sub['status'] == 'KEEP': sub['status'] = 'EMBED'
+                                elif sub['status'] == 'EMBED': sub['status'] = 'REMOVE'
                                 else: sub['status'] = 'KEEP'
-                            else: sub['status'] = 'KEEP'
+                            else:
+                                if sub['status'] == 'KEEP': sub['status'] = 'REMOVE'
+                                elif sub['status'] == 'REMOVE':
+                                    if sub['is_text'] and sub['codec_raw'] != 'subrip': sub['status'] = 'CONVERT'
+                                    else: sub['status'] = 'KEEP'
+                                else: sub['status'] = 'KEEP'
                 h, _ = stdscr.getmaxyx()
                 if my == h - 2: edit_mode = True; curses.curs_set(1)
             except curses.error: pass
@@ -497,15 +525,28 @@ def tui_main(stdscr, args, file_path, initial_subtitles=None, is_batch=False, fi
         elif key == curses.KEY_DOWN: cursor_pos = min(len(subtitles)-1, cursor_pos + 1)
         
         elif key == curses.KEY_RIGHT and is_batch:
-            if file_idx < total_files - 1: return "__NAV_NEXT__", subtitles, None
+            if file_idx < total_files - 1: return "__NAV_NEXT__", subtitles, None, auto_del_ext
             else: curses.flash() # Notify user they are at the end
         elif key == curses.KEY_LEFT and is_batch:
-            if file_idx > 0: return "__NAV_PREV__", subtitles, None
+            if file_idx > 0: return "__NAV_PREV__", subtitles, None, auto_del_ext
             else: curses.flash() # Notify user they are at the start
 
         elif key == ord(' '): 
-            curr = subtitles[cursor_pos]['status']
-            subtitles[cursor_pos]['status'] = 'REMOVE' if curr != 'REMOVE' else 'KEEP'
+            sub = subtitles[cursor_pos]
+            if sub.get('is_external'):
+                if sub['status'] == 'KEEP': sub['status'] = 'EMBED'
+                elif sub['status'] == 'EMBED': sub['status'] = 'REMOVE'
+                else: sub['status'] = 'KEEP'
+            else:
+                sub['status'] = 'REMOVE' if sub['status'] != 'REMOVE' else 'KEEP'
+        elif key in (ord('d'), ord('D')):
+            auto_del_ext = not auto_del_ext
+            for s in subtitles:
+                if s.get('is_external'):
+                    if auto_del_ext and s['status'] == 'KEEP':
+                        s['status'] = 'EMBED'
+                    elif not auto_del_ext and s['status'] == 'EMBED':
+                        s['status'] = 'KEEP'
         elif key in (ord('a'), ord('A')): 
             for s in subtitles:
                 if s['lang'] != 'eng': s['status'] = 'REMOVE'
@@ -517,7 +558,7 @@ def tui_main(stdscr, args, file_path, initial_subtitles=None, is_batch=False, fi
         elif key in (ord('o'), ord('O')): edit_mode = True; curses.curs_set(1)
         elif key in (ord('r'), ord('R')):
             conf = draw_confirmation_popup(stdscr, subtitles, is_batch)
-            if conf in ('Y', 'A'): return output_path, subtitles, conf
+            if conf in ('Y', 'A'): return output_path, subtitles, conf, auto_del_ext
             
     return None
 
@@ -547,6 +588,8 @@ def apply_template_to_file(file_path, template_subs):
 
 def main():
     global VERBOSITY
+    print_version()
+
     parser = argparse.ArgumentParser(description="Interactive Subtitle Tool")
     parser.add_argument("path", nargs="?", help="Input file or directory")
     parser.add_argument("-i", "--input", help="Input video file")
@@ -557,7 +600,6 @@ def main():
     parser.add_argument("-VV", "--very-verbose", action="store_true", help="Debug Mode")
     args = parser.parse_args()
 
-    print_version()
     if args.version: print(VERSION_HISTORY); sys.exit(0)
 
     if args.path and not args.input and not args.dir:
@@ -598,6 +640,7 @@ def main():
     apply_all_mode = False
     template_config = []
     session_persistence = {} # fpath: subs_list
+    auto_del_ext = False
 
     f_idx = 0
     while f_idx < len(files_to_process):
@@ -612,19 +655,21 @@ def main():
 
         try:
             prev_subs = session_persistence.get(fpath)
-            res = curses.wrapper(tui_main, args, fpath, prev_subs, (len(files_to_process) > 1), f_idx, len(files_to_process))
+            res = curses.wrapper(tui_main, args, fpath, prev_subs, (len(files_to_process) > 1), f_idx, len(files_to_process), auto_del_ext)
         except KeyboardInterrupt: log("\nCancelled.", 0); sys.exit(0)
         
         if res and isinstance(res, tuple) and res[0] == "__NAV_NEXT__":
             session_persistence[fpath] = res[1]
+            auto_del_ext = res[3]
             f_idx += 1
         elif res and isinstance(res, tuple) and res[0] == "__NAV_PREV__":
             session_persistence[fpath] = res[1]
+            auto_del_ext = res[3]
             f_idx = max(0, f_idx - 1)
         elif not res:
             f_idx += 1
         else:
-            out_path, subs_list, confirmation = res
+            out_path, subs_list, confirmation, auto_del_ext = res
             if confirmation == 'A':
                 apply_all_mode = True
                 template_config = subs_list
