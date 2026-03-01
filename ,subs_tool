@@ -24,11 +24,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "3.5.0"
+VERSION = "3.6.0"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v3.6.0 perf(core): Pre-flight check to skip files without any modifications
 v3.5.0 feat(batch): Strict Apply All validation, Run [R] executes entire batch queue using session cache
 v3.4.0 feat(ui): Scrub 'External' from embedded track titles and add explicit [EMBEDDED] indicator
 v3.3.0 feat(ext): Track-level EMBED status and [D] global toggle to auto-delete external subs
@@ -601,6 +602,25 @@ def apply_template_to_file(new_subs, template_subs):
             final_subs.append(match)
     return final_subs
 
+def has_file_changed(fpath, out_path, original_subs, new_subs):
+    if fpath != out_path:
+        return True
+        
+    orig_order = [s['original_index'] for s in original_subs]
+    new_order = [s['original_index'] for s in new_subs]
+    if orig_order != new_order:
+        return True
+        
+    for sub in new_subs:
+        if sub.get('is_external'):
+            if sub['status'] in ('KEEP', 'EMBED'):
+                return True
+        else:
+            if sub['status'] in ('REMOVE', 'CONVERT'):
+                return True
+                
+    return False
+
 def main():
     global VERBOSITY
     print_version()
@@ -728,7 +748,6 @@ def main():
         if apply_all_mode:
             baseline_subs = copy.deepcopy(preloaded_subs[fpath])
             subs = apply_template_to_file(baseline_subs, template_config)
-            process_remux(fpath, out_path, subs)
         else:
             if fpath in session_persistence:
                 subs = session_persistence[fpath] # Use user's manual edits
@@ -738,8 +757,12 @@ def main():
                     for s in subs:
                         if s.get('is_external') and s['status'] == 'KEEP':
                             s['status'] = 'EMBED'
+                            
+        if not has_file_changed(fpath, out_path, preloaded_subs[fpath], subs):
+            log("  -> Skipped: No changes detected.", 1)
+            continue
             
-            process_remux(fpath, out_path, subs)
+        process_remux(fpath, out_path, subs)
 
 if __name__ == "__main__":
     main()
