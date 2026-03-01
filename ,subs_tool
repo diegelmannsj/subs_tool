@@ -19,15 +19,17 @@ import os
 import shutil
 import time
 import re
+import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "3.4.0"
+VERSION = "3.5.0"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v3.5.0 feat(batch): Strict Apply All validation, Run [R] executes entire batch queue using session cache
 v3.4.0 feat(ui): Scrub 'External' from embedded track titles and add explicit [EMBEDDED] indicator
 v3.3.0 feat(ext): Track-level EMBED status and [D] global toggle to auto-delete external subs
 v3.2.1 ui(tui): Highlight ideal conversion candidates (Non-SRT Text) in Magenta
@@ -103,6 +105,13 @@ def get_track_structure_signature(file_path):
         codec = s.get('codec_name', 'unk')
         lang = s.get('tags', {}).get('language', 'und')
         sig_parts.append(f"{idx}:{codec}:{lang}")
+    return "|".join(sig_parts)
+
+def get_sub_signature(subs_list):
+    if not subs_list: return "NONE"
+    sig_parts = [str(len(subs_list))]
+    for s in subs_list:
+        sig_parts.append(f"{s['original_index']}:{s['codec_raw']}:{s['lang']}")
     return "|".join(sig_parts)
 
 def format_track_label(sub_dict):
@@ -368,7 +377,7 @@ def draw_menu(stdscr, full_path, subtitles, output_path, cursor_pos, edit_mode, 
     stdscr.addstr(out_y, len(lbl), disp_path, style_path)
     stdscr.refresh()
 
-def draw_confirmation_popup(stdscr, subtitles, is_batch=False):
+def draw_confirmation_popup(stdscr, subtitles, is_batch=False, is_batch_identical=False):
     h, w = stdscr.getmaxyx()
     box_h, box_w = h - 4, w - 8
     start_y, start_x = 2, 4
@@ -381,7 +390,8 @@ def draw_confirmation_popup(stdscr, subtitles, is_batch=False):
     win.addstr(1, 2, title, curses.A_BOLD | curses.A_UNDERLINE)
     
     instr = "Press [Y]es to Proceed"
-    if is_batch: instr += ", [A]pply to All"
+    if is_batch and is_batch_identical: instr += ", [A]pply to All"
+    elif is_batch: instr += " (Batch mismatch - Apply All disabled)"
     instr += ", [N]o/Esc to Cancel"
     win.addstr(box_h-2, 2, instr)
     
@@ -412,7 +422,7 @@ def draw_confirmation_popup(stdscr, subtitles, is_batch=False):
         key = win.getch()
         if key in (ord('y'), ord('Y'), 10, 13): return 'Y'
         if key in (ord('n'), ord('N'), 27): return 'N'
-        if is_batch and key in (ord('a'), ord('A')): return 'A'
+        if is_batch and is_batch_identical and key in (ord('a'), ord('A')): return 'A'
         
         if key == curses.KEY_DOWN:
             if scroll_pos < len(final_list) - max_lines: scroll_pos += 1
@@ -449,7 +459,7 @@ def init_subtitles(file_path):
     if not subtitles: return None
     return subtitles
 
-def tui_main(stdscr, args, file_path, initial_subtitles=None, is_batch=False, file_idx=0, total_files=0, auto_del_ext=False):
+def tui_main(stdscr, args, file_path, initial_subtitles=None, is_batch=False, file_idx=0, total_files=0, auto_del_ext=False, is_batch_identical=False, custom_out_path=None):
     curses.start_color()
     curses.use_default_colors()
     curses.init_pair(1, curses.COLOR_RED, -1)    # Remove
@@ -464,7 +474,7 @@ def tui_main(stdscr, args, file_path, initial_subtitles=None, is_batch=False, fi
     stdscr.timeout(100)
     
     full_path = os.path.abspath(file_path)
-    output_path = file_path
+    output_path = custom_out_path if custom_out_path else file_path
     
     # Load from persistence if available
     subtitles = initial_subtitles if initial_subtitles else init_subtitles(file_path)
@@ -532,10 +542,10 @@ def tui_main(stdscr, args, file_path, initial_subtitles=None, is_batch=False, fi
         elif key == curses.KEY_DOWN: cursor_pos = min(len(subtitles)-1, cursor_pos + 1)
         
         elif key == curses.KEY_RIGHT and is_batch:
-            if file_idx < total_files - 1: return "__NAV_NEXT__", subtitles, None, auto_del_ext
+            if file_idx < total_files - 1: return "__NAV_NEXT__", subtitles, output_path, auto_del_ext
             else: curses.flash() # Notify user they are at the end
         elif key == curses.KEY_LEFT and is_batch:
-            if file_idx > 0: return "__NAV_PREV__", subtitles, None, auto_del_ext
+            if file_idx > 0: return "__NAV_PREV__", subtitles, output_path, auto_del_ext
             else: curses.flash() # Notify user they are at the start
 
         elif key == ord(' '): 
@@ -564,7 +574,7 @@ def tui_main(stdscr, args, file_path, initial_subtitles=None, is_batch=False, fi
         elif key in (ord('m'), ord('M')): move_mode = True
         elif key in (ord('o'), ord('O')): edit_mode = True; curses.curs_set(1)
         elif key in (ord('r'), ord('R')):
-            conf = draw_confirmation_popup(stdscr, subtitles, is_batch)
+            conf = draw_confirmation_popup(stdscr, subtitles, is_batch, is_batch_identical)
             if conf in ('Y', 'A'): return output_path, subtitles, conf, auto_del_ext
             
     return None
@@ -582,9 +592,7 @@ def scan_directory(path, recursive):
             if f.lower().endswith(VIDEO_EXTS): vids.append(os.path.join(path, f))
     return sorted(vids)
 
-def apply_template_to_file(file_path, template_subs):
-    new_subs = init_subtitles(file_path)
-    if not new_subs: return None
+def apply_template_to_file(new_subs, template_subs):
     final_subs = []
     for template_item in template_subs:
         match = next((s for s in new_subs if s['original_index'] == template_item['original_index']), None)
@@ -627,6 +635,9 @@ def main():
 
     # Parallel Screening
     files_to_process = []
+    preloaded_subs = {}
+    is_batch_identical = True
+    
     if len(files_found) > 1:
         log(f"Screening {len(files_found)} files for subtitle tracks...", 1)
         with ThreadPoolExecutor(max_workers=os.cpu_count()) as executor:
@@ -634,54 +645,101 @@ def main():
             done_count = 0
             for future in as_completed(future_to_file):
                 res = future.result()
-                if res: files_to_process.append(future_to_file[future])
+                f = future_to_file[future]
+                if res: 
+                    files_to_process.append(f)
+                    preloaded_subs[f] = res
                 done_count += 1
                 sys.stdout.write(f"\r  -> Progress: {done_count}/{len(files_found)} screened...")
                 sys.stdout.flush()
         files_to_process.sort() # Ensure consistent order
         log(f"\n  -> Found {len(files_to_process)} actionable files.", 1)
         if not files_to_process: sys.exit(0)
-    else: files_to_process = files_found
+        
+        signatures = set()
+        for f in files_to_process:
+            signatures.add(get_sub_signature(preloaded_subs[f]))
+        is_batch_identical = (len(signatures) <= 1)
+        if not is_batch_identical:
+            log("  -> Note: Batch files have varying subtitle tracks. 'Apply All' will be disabled.", 1)
+    else: 
+        files_to_process = files_found
+        for f in files_to_process:
+            preloaded_subs[f] = init_subtitles(f)
 
     # Batch state and persistence
     apply_all_mode = False
     template_config = []
     session_persistence = {} # fpath: subs_list
+    outpath_persistence = {} # fpath: custom_output_path
     auto_del_ext = False
+    execute_batch = False
 
+    # --- TUI Configuration Phase ---
     f_idx = 0
     while f_idx < len(files_to_process):
         fpath = files_to_process[f_idx]
         
-        if apply_all_mode:
-            log(f"\n[{f_idx+1}/{len(files_to_process)}] Processing: {os.path.basename(fpath)}", 1)
-            subs = apply_template_to_file(fpath, template_config)
-            process_remux(fpath, fpath, subs)
-            f_idx += 1
-            continue
+        prev_subs = session_persistence.get(fpath)
+        current_subs = prev_subs if prev_subs else copy.deepcopy(preloaded_subs[fpath])
+        current_out = outpath_persistence.get(fpath, fpath)
 
         try:
-            prev_subs = session_persistence.get(fpath)
-            res = curses.wrapper(tui_main, args, fpath, prev_subs, (len(files_to_process) > 1), f_idx, len(files_to_process), auto_del_ext)
+            res = curses.wrapper(tui_main, args, fpath, current_subs, (len(files_to_process) > 1), f_idx, len(files_to_process), auto_del_ext, is_batch_identical, current_out)
         except KeyboardInterrupt: log("\nCancelled.", 0); sys.exit(0)
         
         if res and isinstance(res, tuple) and res[0] == "__NAV_NEXT__":
             session_persistence[fpath] = res[1]
+            outpath_persistence[fpath] = res[2]
             auto_del_ext = res[3]
             f_idx += 1
         elif res and isinstance(res, tuple) and res[0] == "__NAV_PREV__":
             session_persistence[fpath] = res[1]
+            outpath_persistence[fpath] = res[2]
             auto_del_ext = res[3]
             f_idx = max(0, f_idx - 1)
         elif not res:
             f_idx += 1
         else:
             out_path, subs_list, confirmation, auto_del_ext = res
+            session_persistence[fpath] = subs_list
+            outpath_persistence[fpath] = out_path
+            
             if confirmation == 'A':
                 apply_all_mode = True
                 template_config = subs_list
-            process_remux(fpath, out_path, subs_list)
-            f_idx += 1
+            
+            execute_batch = True
+            break # Exit the TUI loop once Run is confirmed
+            
+    if not execute_batch:
+        sys.exit(0)
+        
+    # --- Batch Execution Phase ---
+    log("\n==================================================", 1)
+    log("            STARTING BATCH EXECUTION              ", 1)
+    log("==================================================", 1)
+
+    for i, fpath in enumerate(files_to_process):
+        log(f"\n[{i+1}/{len(files_to_process)}] Processing: {os.path.basename(fpath)}", 1)
+        
+        out_path = outpath_persistence.get(fpath, fpath)
+        
+        if apply_all_mode:
+            baseline_subs = copy.deepcopy(preloaded_subs[fpath])
+            subs = apply_template_to_file(baseline_subs, template_config)
+            process_remux(fpath, out_path, subs)
+        else:
+            if fpath in session_persistence:
+                subs = session_persistence[fpath] # Use user's manual edits
+            else:
+                subs = copy.deepcopy(preloaded_subs[fpath])
+                if auto_del_ext: # Apply global default rules to skipped files
+                    for s in subs:
+                        if s.get('is_external') and s['status'] == 'KEEP':
+                            s['status'] = 'EMBED'
+            
+            process_remux(fpath, out_path, subs)
 
 if __name__ == "__main__":
     main()
