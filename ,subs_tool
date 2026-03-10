@@ -24,11 +24,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "3.6.0"
+VERSION = "3.6.1"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v3.6.1 fix(tui): Resolve screen flickering by swapping clear() for erase() and skipping redraws on timeout
 v3.6.0 perf(core): Pre-flight check to skip files without any modifications
 v3.5.0 feat(batch): Strict Apply All validation, Run [R] executes entire batch queue using session cache
 v3.4.0 feat(ui): Scrub 'External' from embedded track titles and add explicit [EMBEDDED] indicator
@@ -84,8 +85,9 @@ def log(msg, level=1):
 # --- Core Helper Functions ---
 
 def print_version():
-    log(f",subs_tool - Version {VERSION}", 1)
-    log("-" * 30, 1)
+    # Always print the version regardless of VERBOSITY settings
+    print(f",subs_tool - Version {VERSION}")
+    print("-" * 30)
 
 def get_stream_info(file_path):
     cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_streams", file_path]
@@ -308,7 +310,7 @@ def process_remux(input_path, output_path, subs_list):
 # --- TUI Functions ---
 
 def draw_menu(stdscr, full_path, subtitles, output_path, cursor_pos, edit_mode, move_mode, is_batch=False, file_idx=0, total_files=0, auto_del_ext=False):
-    stdscr.clear()
+    stdscr.erase() # Changed from clear() to prevent UI flickering
     h, w = stdscr.getmaxyx()
     
     counter = f"[{file_idx+1}/{total_files}] " if is_batch else ""
@@ -493,7 +495,12 @@ def tui_main(stdscr, args, file_path, initial_subtitles=None, is_batch=False, fi
     
     while True:
         draw_menu(stdscr, full_path, subtitles, output_path, cursor_pos, edit_mode, move_mode, is_batch, file_idx, total_files, auto_del_ext)
+        
         key = stdscr.getch()
+        
+        # Idle wait loop to prevent constant redrawing and CPU waste
+        while key == -1:
+            key = stdscr.getch()
         
         if key == curses.KEY_MOUSE:
             try:
