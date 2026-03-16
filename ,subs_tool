@@ -24,11 +24,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "3.6.1"
+VERSION = "3.6.2"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v3.6.2 feat(tui): Map 'Enter' to run batch execution (keeps 'R' as hidden fallback)
 v3.6.1 fix(tui): Resolve screen flickering by swapping clear() for erase() and skipping redraws on timeout
 v3.6.0 perf(core): Pre-flight check to skip files without any modifications
 v3.5.0 feat(batch): Strict Apply All validation, Run [R] executes entire batch queue using session cache
@@ -323,7 +324,8 @@ def draw_menu(stdscr, full_path, subtitles, output_path, cursor_pos, edit_mode, 
     else:
         nav_hint = " | [L/R Arrows] Skip File" if is_batch else ""
         del_state = "ON" if auto_del_ext else "OFF"
-        instr = f"[Space/Click] Toggle | [D] Auto-Del: {del_state} | [M] Move | [C] Convert | [R] Run | [Q] Quit{nav_hint}"
+        # Updated to show [Enter] Run instead of [R] Run
+        instr = f"[Space/Click] Toggle | [D] Auto-Del: {del_state} | [M] Move | [C] Convert | [Enter] Run | [Q] Quit{nav_hint}"
         color = curses.A_DIM
         
     stdscr.addstr(1, 0, instr[:w-1], color)
@@ -581,7 +583,8 @@ def tui_main(stdscr, args, file_path, initial_subtitles=None, is_batch=False, fi
             elif sub['is_text'] and sub['codec_raw'] != 'subrip': sub['status'] = 'CONVERT'
         elif key in (ord('m'), ord('M')): move_mode = True
         elif key in (ord('o'), ord('O')): edit_mode = True; curses.curs_set(1)
-        elif key in (ord('r'), ord('R')):
+        # Handle Run via Enter (10/13/KEY_ENTER) or deprecated 'R'/'r'
+        elif key in (ord('r'), ord('R'), 10, 13, curses.KEY_ENTER):
             conf = draw_confirmation_popup(stdscr, subtitles, is_batch, is_batch_identical)
             if conf in ('Y', 'A'): return output_path, subtitles, conf, auto_del_ext
             
