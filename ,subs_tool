@@ -24,11 +24,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "3.6.2"
+VERSION = "3.6.3"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v3.6.3 fix(core): Warn user and exit gracefully when no subtitles are found in single-file mode
 v3.6.2 feat(tui): Map 'Enter' to run batch execution (keeps 'R' as hidden fallback)
 v3.6.1 fix(tui): Resolve screen flickering by swapping clear() for erase() and skipping redraws on timeout
 v3.6.0 perf(core): Pre-flight check to skip files without any modifications
@@ -642,7 +643,7 @@ def main():
     parser.add_argument("-R", "--recursive", action="store_true", help="Recursive scan")
     parser.add_argument("-v", "--version", action="store_true", help="Show history")
     parser.add_argument("-q", "--quiet", action="store_true", help="Quiet Mode")
-    parser.add_argument("-VV", "--very-verbose", action="store_true", help="Debug Mode")
+    parser.add_argument("-V", "--very-verbose", action="store_true", help="Debug Mode")
     args = parser.parse_args()
 
     if args.version: print(VERSION_HISTORY); sys.exit(0)
@@ -693,9 +694,16 @@ def main():
         if not is_batch_identical:
             log("  -> Note: Batch files have varying subtitle tracks. 'Apply All' will be disabled.", 1)
     else: 
-        files_to_process = files_found
-        for f in files_to_process:
-            preloaded_subs[f] = init_subtitles(f)
+        for f in files_found:
+            subs = init_subtitles(f)
+            if subs:
+                preloaded_subs[f] = subs
+                files_to_process.append(f)
+            else:
+                log(f"\nWarning: No internal or external subtitles found for '{os.path.basename(f)}'.", 0)
+                
+        if not files_to_process:
+            sys.exit(0)
 
     # Batch state and persistence
     apply_all_mode = False
