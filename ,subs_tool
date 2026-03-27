@@ -24,11 +24,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "3.6.5"
+VERSION = "3.6.6"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v3.6.6 fix(core): auto-convert output container to .mkv when input is .avi to support embedded subtitles
 v3.6.5 feat(core): auto-prompt recursive search on empty dir, default to current dir
 v3.6.4 fix(core): resolve external subtitle detection failure when passing relative file paths
 v3.6.3 fix(core): Warn user and exit gracefully when no subtitles are found in single-file mode
@@ -299,6 +300,15 @@ def process_remux(input_path, output_path, subs_list):
             if smart_move_file(temp_final, output_path):
                 log("Success!", 1)
                 
+                # Cleanup original AVI if we converted to MKV
+                if input_path != output_path and input_path.lower().endswith('.avi') and output_path.lower().endswith('.mkv'):
+                    if os.path.exists(input_path):
+                        try:
+                            os.remove(input_path)
+                            log(f"Cleaned up original AVI file: {os.path.basename(input_path)}", 1)
+                        except OSError as e:
+                            log(f"Warning: Failed to delete original AVI {os.path.basename(input_path)}: {e}", 0)
+                
                 # Auto-cleanup for EMBED files after successful move
                 for ext in external_keeps:
                     if ext['status'] == 'EMBED':
@@ -483,7 +493,11 @@ def tui_main(stdscr, args, file_path, initial_subtitles=None, is_batch=False, fi
     stdscr.timeout(100)
     
     full_path = os.path.abspath(file_path)
-    output_path = custom_out_path if custom_out_path else file_path
+    output_path = custom_out_path if custom_out_path else full_path
+    
+    # Auto-swap AVI to MKV for the default output path to support embedding
+    if output_path.lower().endswith('.avi'):
+        output_path = output_path[:-4] + '.mkv'
     
     # Load from persistence if available
     subtitles = initial_subtitles if initial_subtitles else init_subtitles(file_path)
@@ -793,6 +807,11 @@ def main():
         
         out_path = outpath_persistence.get(fpath, fpath)
         
+        # Enforce MKV for AVI files (FFmpeg cannot embed subs into AVI)
+        if out_path.lower().endswith('.avi'):
+            out_path = out_path[:-4] + '.mkv'
+            log("  -> Note: Output container changed to MKV (AVI does not support embedded subs).", 1)
+            
         if apply_all_mode:
             baseline_subs = copy.deepcopy(preloaded_subs[fpath])
             subs = apply_template_to_file(baseline_subs, template_config)
