@@ -24,11 +24,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "3.6.4"
+VERSION = "3.6.5"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v3.6.5 feat(core): auto-prompt recursive search on empty dir, default to current dir
 v3.6.4 fix(core): resolve external subtitle detection failure when passing relative file paths
 v3.6.3 fix(core): Warn user and exit gracefully when no subtitles are found in single-file mode
 v3.6.2 feat(tui): Map 'Enter' to run batch execution (keeps 'R' as hidden fallback)
@@ -654,17 +655,44 @@ def main():
         if os.path.isdir(args.path): args.dir = args.path
         else: args.input = args.path
 
+    # Auto-fallback to current working directory if no inputs are supplied
+    if not args.input and not args.dir and not args.path:
+        args.dir = "."
+
     VERBOSITY = 0 if args.quiet else (2 if args.very_verbose else 1)
     
     files_found = []
     if args.input:
         if os.path.exists(args.input): files_found = [args.input]
-        else: log("Error: File not found.", 0); sys.exit(1)
+        else: log(f"Error: File '{args.input}' not found.", 0); sys.exit(1)
     elif args.dir:
         if os.path.exists(args.dir):
             files_found = scan_directory(args.dir, args.recursive)
-        else: log("Error: Directory not found.", 0); sys.exit(1)
-    else: log("Error: Input required.", 0); sys.exit(1)
+        else: log(f"Error: Directory '{args.dir}' not found.", 0); sys.exit(1)
+
+    # Missing files check and recursive prompt
+    if not files_found:
+        print(f"No video files found in '{args.dir}'.")
+        if not args.recursive:
+            try:
+                choice = input(f"Would you like to search recursively in subdirectories of '{args.dir}' for videos? [y/N]: ").strip().lower()
+                if choice in ['y', 'yes']:
+                    print("Scanning subdirectories recursively...")
+                    files_found = scan_directory(args.dir, True)
+                    if not files_found:
+                        print("Still no video files found after recursive search. Exiting.")
+                        sys.exit(0)
+                    else:
+                        print(f"Found {len(files_found)} video file(s) recursively.\n")
+                else:
+                    print("Operation cancelled. Exiting.")
+                    sys.exit(0)
+            except KeyboardInterrupt:
+                print("\nOperation cancelled. Exiting.")
+                sys.exit(0)
+        else:
+            print("Exiting.")
+            sys.exit(0)
 
     # Parallel Screening
     files_to_process = []
