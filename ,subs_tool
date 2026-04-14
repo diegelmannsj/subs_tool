@@ -24,11 +24,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "3.7.0"
+VERSION = "3.7.1"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v3.7.1 fix(core): resolve KeyError on 'original_index' when processing audio tracks during remuxing
 v3.7.0 feat(audio): add Audio TUI supporting removal, rearrangement, and non-Eng auto-removal
 v3.6.6 fix(core): auto-convert output container to .mkv when input is .avi to support embedded subtitles
 v3.6.5 feat(core): auto-prompt recursive search on empty dir, default to current dir
@@ -259,7 +260,7 @@ def process_remux(input_path, output_path, subs_list, audio_list=None):
     # Audio Map logic
     audio_changed = False
     if audio_list:
-        orig_order = [a['original_index'] for a in all_streams if a.get('codec_type') == 'audio']
+        orig_order = [a['index'] for a in all_streams if a.get('codec_type') == 'audio']
         new_order = [a['original_index'] for a in audio_list]
         removed = any(a['status'] == 'REMOVE' for a in audio_list)
         if orig_order != new_order or removed:
