@@ -24,11 +24,16 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "3.7.1"
+VERSION = "3.7.2"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v3.7.2 fix(ext): broaden external subtitle detection
+        - Removed strict base_name requirement for sidecar subtitles.
+        - The tool will now automatically detect and load all valid subtitle files
+          present in the video's directory, regardless of naming discrepancies.
+          
 v3.7.1 fix(core): resolve KeyError on 'original_index' when processing audio tracks during remuxing
 v3.7.0 feat(audio): add Audio TUI supporting removal, rearrangement, and non-Eng auto-removal
 v3.6.6 fix(core): auto-convert output container to .mkv when input is .avi to support embedded subtitles
@@ -133,12 +138,11 @@ def format_track_label(track_dict, track_type="Subtitle"):
 def scan_external_subs(video_path):
     abs_video_path = os.path.abspath(video_path)
     base_dir = os.path.dirname(abs_video_path)
-    base_name = os.path.splitext(os.path.basename(abs_video_path))[0]
     external_subs = []
     
     try:
         for f in os.listdir(base_dir):
-            if f.startswith(base_name) and f.lower().endswith(SUB_EXTS):
+            if f.lower().endswith(SUB_EXTS):
                 if f.lower().endswith('.idx'): continue
                 full_path = os.path.join(base_dir, f)
                 streams = get_stream_info(full_path)
