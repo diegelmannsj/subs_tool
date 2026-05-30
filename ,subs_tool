@@ -24,11 +24,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "3.7.2"
+VERSION = "3.7.3"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v3.7.3 fix(core): prevent empty/0-byte converted subtitles from crashing the remuxer by falling back to KEEP
 v3.7.2 fix(ext): broaden external subtitle detection
         - Removed strict base_name requirement for sidecar subtitles.
         - The tool will now automatically detect and load all valid subtitle files
@@ -179,7 +180,14 @@ def perform_text_conversion(input_file, stream_index, output_srt):
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error", "-i", input_file, "-map", f"0:{stream_index}", "-c:s", "srt", "-y", output_srt]
     try:
         subprocess.run(cmd, check=True)
-        return True
+        # Verify the file is not 0 bytes (common with empty forced tracks)
+        if os.path.exists(output_srt) and os.path.getsize(output_srt) > 0:
+            return True
+        else:
+            log(f"    -> Warning: Conversion produced an empty file. Reverting status to KEEP.", 1)
+            if os.path.exists(output_srt):
+                os.remove(output_srt)
+            return False
     except subprocess.CalledProcessError as e:
         log(f"    -> Conversion Failed: {e}", 1)
         return False
@@ -234,14 +242,18 @@ def process_remux(input_path, output_path, subs_list, audio_list=None):
                 success = perform_text_conversion(conv_input_path, conv_stream_idx, srt_path)
             else:
                 log(f"Warning: Skipping image-based stream #{idx}. OCR removed.", 1)
-                sub['status'] = 'KEEP'
+                success = False
 
             if success:
                 clean_title = f"{sub['title']} - SRT" if sub['title'] else "SRT"
                 converted_inputs[idx] = {'path': srt_path, 'lang': sub['lang'], 'title': clean_title}
+            else:
+                if sub['is_text']: 
+                    # Only log if it was actually attempted to be converted but failed/empty
+                    log(f"    -> Reverting Stream #{idx} status to 'KEEP'", 1)
+                sub['status'] = 'KEEP'
 
     log("\n--- Building Final File ---", 1)
-    # مشین ہیز QSV (Machine has QSV); however, remuxing (-c copy) uses near-zero CPU and bypasses transcoders entirely.
     cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-stats", "-i", input_path]
     
     sorted_conv_indices = sorted(converted_inputs.keys())
