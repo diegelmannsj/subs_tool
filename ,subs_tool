@@ -24,11 +24,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "3.8.0"
+VERSION = "3.8.1"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v3.8.1 fix(ui): pause curses timeout during metadata prompt to prevent instant skipping
 v3.8.0 feat(core): add metadata editing (title/language) and --no-mouse flag
 v3.7.3 fix(core): prevent empty/0-byte converted subtitles from crashing the remuxer by falling back to KEEP
 v3.7.2 fix(ext): broaden external subtitle detection
@@ -407,6 +408,7 @@ def prompt_metadata(stdscr, track, track_type):
     
     curses.echo()
     curses.curs_set(1)
+    stdscr.timeout(-1)  # Disable timeout so prompt waits for user input
     
     # Prompt 1: Jellyfin Language Code
     lang_prompt = f"Language (3-letter ISO, e.g., eng, jpn) [{curr_lang}]: "
@@ -428,6 +430,7 @@ def prompt_metadata(stdscr, track, track_type):
         
     curses.noecho()
     curses.curs_set(0)
+    stdscr.timeout(100) # Restore 100ms timeout for the main loop
     
     # Apply changes (saving them to 'edit_lang' and 'edit_title' state)
     if lang_in:
