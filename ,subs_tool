@@ -24,11 +24,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "3.7.3"
+VERSION = "3.8.0"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v3.8.0 feat(core): add metadata editing (title/language) and --no-mouse flag
 v3.7.3 fix(core): prevent empty/0-byte converted subtitles from crashing the remuxer by falling back to KEEP
 v3.7.2 fix(ext): broaden external subtitle detection
         - Removed strict base_name requirement for sidecar subtitles.
@@ -121,20 +122,27 @@ def get_media_signature(audio_list, subs_list):
     return "|".join(sig_parts) if sig_parts else "NONE"
 
 def format_track_label(track_dict, track_type="Subtitle"):
-    lang_name = ISO_639_MAP.get(track_dict['lang'], track_dict['lang'])
+    lang = track_dict.get('edit_lang', track_dict['lang'])
+    lang_name = ISO_639_MAP.get(lang, lang)
     codec = track_dict.get('codec_friendly', track_dict.get('codec_raw', ''))
-    title_str = f" - {track_dict['title']}" if track_dict.get('title') else ""
+    
+    if 'edit_title' in track_dict:
+        title = track_dict['edit_title']
+    else:
+        title = track_dict.get('title', '')
+        
+    title_str = f" - {title}" if title else ""
     
     if track_type == "Audio":
         channels = track_dict.get('channels', 'unknown')
-        return f"Stream #{track_dict['original_index']}: {lang_name} [{track_dict['lang']}] [{codec}] ({channels} channels){title_str}"
+        return f"Stream #{track_dict['original_index']}: {lang_name} [{lang}] [{codec}] ({channels} channels){title_str}"
     
     type_tag = "[TXT]" if track_dict['is_text'] else "[IMG]"
     
     if track_dict.get('is_external'):
-        return f"[EXTERNAL] {lang_name} [{codec}] {type_tag} ({os.path.basename(track_dict['file_path'])})"
+        return f"[EXTERNAL] {lang_name} [{codec}] {type_tag} ({os.path.basename(track_dict['file_path'])}){title_str}"
     
-    return f"Stream #{track_dict['original_index']} [EMBEDDED]: {lang_name} [{track_dict['lang']}] [{codec}] {type_tag}{title_str}"
+    return f"Stream #{track_dict['original_index']} [EMBEDDED]: {lang_name} [{lang}] [{codec}] {type_tag}{title_str}"
 
 def scan_external_subs(video_path):
     abs_video_path = os.path.abspath(video_path)
@@ -279,7 +287,8 @@ def process_remux(input_path, output_path, subs_list, audio_list=None):
         orig_order = [a['index'] for a in all_streams if a.get('codec_type') == 'audio']
         new_order = [a['original_index'] for a in audio_list]
         removed = any(a['status'] == 'REMOVE' for a in audio_list)
-        if orig_order != new_order or removed:
+        edited = any('edit_lang' in a or 'edit_title' in a for a in audio_list)
+        if orig_order != new_order or removed or edited:
             audio_changed = True
 
     if audio_changed:
@@ -288,6 +297,11 @@ def process_remux(input_path, output_path, subs_list, audio_list=None):
             cmd.extend(["-map", f"0:{a['original_index']}"])
             disp = "default" if i == 0 else "0"
             cmd.extend([f"-disposition:a:{i}", disp])
+            
+            if 'edit_lang' in a:
+                cmd.extend([f"-metadata:s:a:{i}", f"language={a['edit_lang']}"])
+            if 'edit_title' in a:
+                cmd.extend([f"-metadata:s:a:{i}", f"title={a['edit_title']}"])
     else:
         for s in all_streams:
             if s.get('codec_type') == 'audio': cmd.extend(["-map", f"0:{s['index']}"])
@@ -303,17 +317,31 @@ def process_remux(input_path, output_path, subs_list, audio_list=None):
                 if orig_idx in extra_inputs_map:
                     input_idx = extra_inputs_map[orig_idx]
                     cmd.extend(["-map", f"{input_idx}:0"])
-                    cmd.extend([f"-metadata:s:s:{current_out_idx}", f"language={sub['lang']}", f"-metadata:s:s:{current_out_idx}", f"title={sub['title']}"])
+                    
+                    lang = sub.get('edit_lang', sub['lang'])
+                    title = sub.get('edit_title', sub['title'])
+                    
+                    cmd.extend([f"-metadata:s:s:{current_out_idx}", f"language={lang}", f"-metadata:s:s:{current_out_idx}", f"title={title}"])
                     current_out_idx += 1
             else:
                 cmd.extend(["-map", f"0:{orig_idx}"])
+                
+                if 'edit_lang' in sub:
+                    cmd.extend([f"-metadata:s:s:{current_out_idx}", f"language={sub['edit_lang']}"])
+                if 'edit_title' in sub:
+                    cmd.extend([f"-metadata:s:s:{current_out_idx}", f"title={sub['edit_title']}"])
+                    
                 current_out_idx += 1
         elif status == 'CONVERT':
             if orig_idx in converted_inputs:
                 input_idx = input_file_map[orig_idx]
                 cmd.extend(["-map", f"{input_idx}:0"])
                 meta = converted_inputs[orig_idx]
-                cmd.extend([f"-metadata:s:s:{current_out_idx}", f"language={meta['lang']}", f"-metadata:s:s:{current_out_idx}", f"title={meta['title']}"])
+                
+                lang = sub.get('edit_lang', meta['lang'])
+                title = sub.get('edit_title', meta['title'])
+                
+                cmd.extend([f"-metadata:s:s:{current_out_idx}", f"language={lang}", f"-metadata:s:s:{current_out_idx}", f"title={title}"])
                 current_out_idx += 1
             else:
                 if not sub.get('is_external'):
@@ -353,6 +381,69 @@ def process_remux(input_path, output_path, subs_list, audio_list=None):
 
 # --- TUI Functions ---
 
+def prompt_metadata(stdscr, track, track_type):
+    """
+    Prompt user for Jellyfin-compatible Language and Title metadata.
+    """
+    h, w = stdscr.getmaxyx()
+    
+    # Fetch existing metadata tags if they exist
+    curr_lang = track.get('edit_lang', track.get('lang', 'und'))
+    
+    if 'edit_title' in track:
+        curr_title = track['edit_title']
+    else:
+        curr_title = track.get('title', '')
+        
+    if not curr_title:
+        curr_title = "None"
+        
+    # Clear a clean block at the bottom for the prompts
+    for i in range(1, 6):
+        stdscr.move(h - i, 0)
+        stdscr.clrtoeol()
+        
+    stdscr.addstr(h - 5, 2, f"--- Edit {track_type} Track Metadata ---", curses.A_BOLD)
+    
+    curses.echo()
+    curses.curs_set(1)
+    
+    # Prompt 1: Jellyfin Language Code
+    lang_prompt = f"Language (3-letter ISO, e.g., eng, jpn) [{curr_lang}]: "
+    stdscr.addstr(h - 4, 2, lang_prompt)
+    stdscr.refresh()
+    try:
+        lang_in = stdscr.getstr(h - 4, 2 + len(lang_prompt)).decode('utf-8').strip()
+    except Exception:
+        lang_in = ""
+        
+    # Prompt 2: Jellyfin Display Title
+    title_prompt = f"Title (e.g., Stereo, Commentary. Type CLEAR to blank) [{curr_title}]: "
+    stdscr.addstr(h - 3, 2, title_prompt)
+    stdscr.refresh()
+    try:
+        title_in = stdscr.getstr(h - 3, 2 + len(title_prompt)).decode('utf-8').strip()
+    except Exception:
+        title_in = ""
+        
+    curses.noecho()
+    curses.curs_set(0)
+    
+    # Apply changes (saving them to 'edit_lang' and 'edit_title' state)
+    if lang_in:
+        track['edit_lang'] = lang_in.lower()
+    if title_in:
+        if title_in.upper() == "CLEAR":
+            track['edit_title'] = ""
+        else:
+            track['edit_title'] = title_in
+            
+    # Clear the prompt area before returning to the main menu
+    for i in range(1, 6):
+        stdscr.move(h - i, 0)
+        stdscr.clrtoeol()
+
+
 def draw_menu(stdscr, full_path, tracks, output_path, cursor_pos, edit_mode, move_mode, is_batch=False, file_idx=0, total_files=0, auto_del_ext=False, track_type="Subtitle"):
     stdscr.erase()
     h, w = stdscr.getmaxyx()
@@ -368,9 +459,9 @@ def draw_menu(stdscr, full_path, tracks, output_path, cursor_pos, edit_mode, mov
         nav_hint = " | [L/R Arrows] Skip File" if is_batch else ""
         if track_type == "Subtitle":
             del_state = "ON" if auto_del_ext else "OFF"
-            instr = f"[Space/Click] Toggle | [D] Auto-Del: {del_state} | [M] Move | [C] Convert | [Enter] Run | [Q] Quit{nav_hint}"
+            instr = f"[Space/Click] Toggle | [D] Auto-Del: {del_state} | [M] Move | [E] Edit Meta | [C] Convert | [Enter] Run | [Q] Quit{nav_hint}"
         else:
-            instr = f"[Space/Click] Toggle | [A] Auto-remove non-Eng | [M] Move | [Enter] Run/Next | [Q] Quit{nav_hint}"
+            instr = f"[Space/Click] Toggle | [A] Auto-remove non-Eng | [M] Move | [E] Edit Meta | [Enter] Run/Next | [Q] Quit{nav_hint}"
         color = curses.A_DIM
         
     stdscr.addstr(1, 0, instr[:w-1], color)
@@ -459,20 +550,29 @@ def draw_confirmation_popup(stdscr, tracks, is_batch=False, is_batch_identical=F
                 continue
             sub = final_list[idx]
             prefix = f"{idx+1}. "
-            lang_name = ISO_639_MAP.get(sub['lang'], sub['lang'])
+            
+            lang = sub.get('edit_lang', sub['lang'])
+            lang_name = ISO_639_MAP.get(lang, lang)
             codec = sub.get('codec_friendly', sub.get('codec_raw', ''))
+            
+            if 'edit_title' in sub:
+                title = sub['edit_title']
+            else:
+                title = sub.get('title', '')
+            title_str = f" - {title}" if title else ""
+            
             note = ""
             attr = curses.color_pair(2)
             
             if track_type == "Audio":
                 channels = sub.get('channels', 'unknown')
-                line = f"{prefix}{lang_name} [{codec}] ({channels} channels)"
+                line = f"{prefix}{lang_name} [{codec}] ({channels} channels){title_str}"
             else:
                 if sub['status'] == 'CONVERT':
                     codec = "SRT"; note = " (Converted)"; attr = curses.color_pair(3)
                 elif sub['status'] == 'EMBED':
                     note = " (Embed & Del)"; attr = curses.color_pair(6)
-                line = f"{prefix}{lang_name} [{codec}]{note}"
+                line = f"{prefix}{lang_name} [{codec}]{title_str}{note}"
                 
             win.addstr(2+i, 2, line[:box_w-4].ljust(box_w-4), attr)
         
@@ -543,7 +643,12 @@ def tui_main(stdscr, args, file_path, initial_tracks=None, is_batch=False, file_
     curses.init_pair(4, curses.COLOR_YELLOW, -1) # Moving
     curses.init_pair(5, curses.COLOR_MAGENTA, -1) # Ideal Candidate Highlight
     curses.init_pair(6, curses.COLOR_YELLOW, -1) # Embed External Highlight
-    curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+    
+    if not args.no_mouse:
+        try:
+            curses.mousemask(curses.ALL_MOUSE_EVENTS | curses.REPORT_MOUSE_POSITION)
+        except curses.error:
+            pass
     
     curses.curs_set(0)
     stdscr.timeout(100)
@@ -574,7 +679,7 @@ def tui_main(stdscr, args, file_path, initial_tracks=None, is_batch=False, file_
         while key == -1:
             key = stdscr.getch()
         
-        if key == curses.KEY_MOUSE:
+        if key == curses.KEY_MOUSE and not args.no_mouse:
             try:
                 _, mx, my, _, _ = curses.getmouse()
                 list_start_y = 3
@@ -661,6 +766,10 @@ def tui_main(stdscr, args, file_path, initial_tracks=None, is_batch=False, file_
             if sub['status'] == 'CONVERT': sub['status'] = 'KEEP'
             elif sub['is_text'] and sub['codec_raw'] != 'subrip': sub['status'] = 'CONVERT'
             
+        elif key in (ord('e'), ord('E')):
+            if len(tracks) > 0:
+                prompt_metadata(stdscr, tracks[cursor_pos], track_type)
+
         elif key in (ord('m'), ord('M')): move_mode = True
         elif key in (ord('o'), ord('O')): edit_mode = True; curses.curs_set(1)
         
@@ -692,6 +801,10 @@ def apply_template_to_file(new_tracks, template_tracks):
         match = next((s for s in new_tracks if s['original_index'] == template_item['original_index']), None)
         if match:
             match['status'] = template_item['status']
+            if 'edit_lang' in template_item:
+                match['edit_lang'] = template_item['edit_lang']
+            if 'edit_title' in template_item:
+                match['edit_title'] = template_item['edit_title']
             final_tracks.append(match)
     return final_tracks
 
@@ -703,12 +816,14 @@ def has_file_changed(fpath, out_path, original_subs, new_subs, original_audio=No
         new_order = [a['original_index'] for a in new_audio]
         if orig_order != new_order: return True
         if any(a['status'] == 'REMOVE' for a in new_audio): return True
+        if any('edit_lang' in a or 'edit_title' in a for a in new_audio): return True
         
     orig_order = [s['original_index'] for s in original_subs]
     new_order = [s['original_index'] for s in new_subs]
     if orig_order != new_order: return True
         
     for sub in new_subs:
+        if 'edit_lang' in sub or 'edit_title' in sub: return True
         if sub.get('is_external'):
             if sub['status'] in ('KEEP', 'EMBED'): return True
         else:
@@ -727,6 +842,7 @@ def main():
     parser.add_argument("-R", "--recursive", action="store_true", help="Recursive scan")
     parser.add_argument("-A", "--audio", action="store_true", help="Skip subtitle processing and directly configure audio tracks")
     parser.add_argument("-s", "--subs", action="store_true", help="Skip audio prompt and directly configure subtitle tracks")
+    parser.add_argument("-N", "--no-mouse", action="store_true", help="Disable mouse clicking in TUI")
     parser.add_argument("-v", "--version", action="store_true", help="Show history")
     parser.add_argument("-q", "--quiet", action="store_true", help="Quiet Mode")
     parser.add_argument("-V", "--very-verbose", action="store_true", help="Debug Mode")
@@ -863,8 +979,6 @@ def main():
         current_audio = session_audio_persistence.get(fpath, copy.deepcopy(preloaded_audio[fpath]))
         current_subs = session_subs_persistence.get(fpath, copy.deepcopy(preloaded_subs[fpath]))
         current_out = outpath_persistence.get(fpath, fpath)
-
-        navigated = False
         
         if do_audio:
             try:
