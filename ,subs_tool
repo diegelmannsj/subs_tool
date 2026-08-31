@@ -24,38 +24,22 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # --- Configuration ---
 TEMP_DIR = "/storage/temp/"
-VERSION = "3.8.1"
+VERSION = "3.10.0"
 
 VERSION_HISTORY = f"""
 ,subs_tool v{VERSION}
 ---------------------------------
+v3.10.0 feat(cli): add explicit help aliases and Bash completion
+v3.9.1 fix(core): encode text subtitles as mov_text for MP4 outputs
+v3.9.0 feat(ext): add automated subtitle search and injection via subliminal ([S] keybind)
 v3.8.1 fix(ui): pause curses timeout during metadata prompt to prevent instant skipping
 v3.8.0 feat(core): add metadata editing (title/language) and --no-mouse flag
-v3.7.3 fix(core): prevent empty/0-byte converted subtitles from crashing the remuxer by falling back to KEEP
+v3.7.3 fix(core): prevent empty/0-byte converted subtitles from crashing the remuxer
 v3.7.2 fix(ext): broaden external subtitle detection
-        - Removed strict base_name requirement for sidecar subtitles.
-        - The tool will now automatically detect and load all valid subtitle files
-          present in the video's directory, regardless of naming discrepancies.
-          
-v3.7.1 fix(core): resolve KeyError on 'original_index' when processing audio tracks during remuxing
+v3.7.1 fix(core): resolve KeyError on 'original_index' when processing audio tracks
 v3.7.0 feat(audio): add Audio TUI supporting removal, rearrangement, and non-Eng auto-removal
-v3.6.6 fix(core): auto-convert output container to .mkv when input is .avi to support embedded subtitles
+v3.6.6 fix(core): auto-convert output container to .mkv when input is .avi
 v3.6.5 feat(core): auto-prompt recursive search on empty dir, default to current dir
-v3.6.4 fix(core): resolve external subtitle detection failure when passing relative file paths
-v3.6.3 fix(core): Warn user and exit gracefully when no subtitles are found in single-file mode
-v3.6.2 feat(tui): Map 'Enter' to run batch execution (keeps 'R' as hidden fallback)
-v3.6.1 fix(tui): Resolve screen flickering by swapping clear() for erase() and skipping redraws on timeout
-v3.6.0 perf(core): Pre-flight check to skip files without any modifications
-v3.5.0 feat(batch): Strict Apply All validation, Run [R] executes entire batch queue using session cache
-v3.4.0 feat(ui): Scrub 'External' from embedded track titles and add explicit [EMBEDDED] indicator
-v3.3.0 feat(ext): Track-level EMBED status and [D] global toggle to auto-delete external subs
-v3.2.1 ui(tui): Highlight ideal conversion candidates (Non-SRT Text) in Magenta
-v3.2.0 feat(batch): Parallel screening, session persistence, and boundary flash
-v3.1.1 feat(core): Pre-screen batch files to skip those without subtitles
-v3.1.0 feat(tui): Next/Prev file navigation via Left/Right arrows
-v3.0.2 feat(cli): Positional path argument (detects file vs dir)
-v3.0.1 feat(ui): Show full path in header
-v3.0.0 refactor(core): Remove OCR & Slim Down
 """
 
 # --- Constants & Mappings ---
@@ -183,6 +167,37 @@ def scan_external_subs(video_path):
     except OSError: pass
     return external_subs
 
+def scan_single_external_sub(full_path, original_index=-1):
+    """Scan a newly downloaded subtitle file to inject into the TUI."""
+    try:
+        streams = get_stream_info(full_path)
+        if streams:
+            s = streams[0]
+            codec_raw = s.get('codec_name', 'unknown')
+            lang = 'und'
+            parts = os.path.basename(full_path).split('.')
+            if len(parts) > 2:
+                potential_lang = parts[-2].lower()
+                if len(potential_lang) == 3 and potential_lang in ISO_639_MAP:
+                    lang = potential_lang
+                elif potential_lang in ['english', 'en']: lang = 'eng'
+            if s.get('tags', {}).get('language', 'und') != 'und':
+                lang = s.get('tags', {}).get('language')
+
+            return {
+                'original_index': original_index,
+                'is_external': True,
+                'file_path': full_path,
+                'lang': lang,
+                'title': 'Downloaded',
+                'codec_raw': codec_raw,
+                'codec_friendly': SUBTITLE_CODEC_MAP.get(codec_raw, codec_raw),
+                'is_text': codec_raw in TEXT_BASED_CODECS,
+                'status': 'EMBED' # Auto-embed by default!
+            }
+    except Exception: pass
+    return None
+
 def perform_text_conversion(input_file, stream_index, output_srt):
     log(f"    ... Converting Stream #{stream_index} (Text-Based) -> SRT...", 1)
     # Machine has QSV, but subtitle conversion is CPU-bound text processing; no QSV encoder for subtitles exists.
@@ -258,12 +273,13 @@ def process_remux(input_path, output_path, subs_list, audio_list=None):
                 converted_inputs[idx] = {'path': srt_path, 'lang': sub['lang'], 'title': clean_title}
             else:
                 if sub['is_text']: 
-                    # Only log if it was actually attempted to be converted but failed/empty
                     log(f"    -> Reverting Stream #{idx} status to 'KEEP'", 1)
                 sub['status'] = 'KEEP'
 
     log("\n--- Building Final File ---", 1)
     cmd = ["ffmpeg", "-hide_banner", "-v", "error", "-stats", "-i", input_path]
+    mp4_output = os.path.splitext(output_path)[1].lower() == '.mp4'
+    mp4_mov_text_streams = []
     
     sorted_conv_indices = sorted(converted_inputs.keys())
     input_file_map = {}
@@ -282,7 +298,6 @@ def process_remux(input_path, output_path, subs_list, audio_list=None):
     for s in all_streams:
         if s.get('codec_type') == 'video': cmd.extend(["-map", f"0:{s['index']}"])
             
-    # Audio Map logic
     audio_changed = False
     if audio_list:
         orig_order = [a['index'] for a in all_streams if a.get('codec_type') == 'audio']
@@ -323,6 +338,8 @@ def process_remux(input_path, output_path, subs_list, audio_list=None):
                     title = sub.get('edit_title', sub['title'])
                     
                     cmd.extend([f"-metadata:s:s:{current_out_idx}", f"language={lang}", f"-metadata:s:s:{current_out_idx}", f"title={title}"])
+                    if mp4_output and sub['is_text'] and sub['codec_raw'] != 'mov_text':
+                        mp4_mov_text_streams.append(current_out_idx)
                     current_out_idx += 1
             else:
                 cmd.extend(["-map", f"0:{orig_idx}"])
@@ -332,6 +349,8 @@ def process_remux(input_path, output_path, subs_list, audio_list=None):
                 if 'edit_title' in sub:
                     cmd.extend([f"-metadata:s:s:{current_out_idx}", f"title={sub['edit_title']}"])
                     
+                if mp4_output and sub['is_text'] and sub['codec_raw'] != 'mov_text':
+                    mp4_mov_text_streams.append(current_out_idx)
                 current_out_idx += 1
         elif status == 'CONVERT':
             if orig_idx in converted_inputs:
@@ -343,6 +362,8 @@ def process_remux(input_path, output_path, subs_list, audio_list=None):
                 title = sub.get('edit_title', meta['title'])
                 
                 cmd.extend([f"-metadata:s:s:{current_out_idx}", f"language={lang}", f"-metadata:s:s:{current_out_idx}", f"title={title}"])
+                if mp4_output:
+                    mp4_mov_text_streams.append(current_out_idx)
                 current_out_idx += 1
             else:
                 if not sub.get('is_external'):
@@ -350,7 +371,10 @@ def process_remux(input_path, output_path, subs_list, audio_list=None):
                     current_out_idx += 1
 
     cmd.extend(["-map", "0:d?", "-map", "0:t?"])
-    cmd.extend(["-c", "copy", "-map_metadata", "0", "-y", temp_final])
+    cmd.extend(["-c", "copy"])
+    for stream_idx in mp4_mov_text_streams:
+        cmd.extend([f"-c:s:{stream_idx}", "mov_text"])
+    cmd.extend(["-map_metadata", "0", "-y", temp_final])
     
     try:
         subprocess.run(cmd, check=True)
@@ -380,15 +404,61 @@ def process_remux(input_path, output_path, subs_list, audio_list=None):
     finally:
         if os.path.exists(ocr_work_dir): shutil.rmtree(ocr_work_dir)
 
+
 # --- TUI Functions ---
 
-def prompt_metadata(stdscr, track, track_type):
-    """
-    Prompt user for Jellyfin-compatible Language and Title metadata.
-    """
+def prompt_simple_input(stdscr, prompt_text, default_val):
+    """Helper to ask a simple question in the TUI."""
     h, w = stdscr.getmaxyx()
     
-    # Fetch existing metadata tags if they exist
+    stdscr.move(h - 3, 0)
+    stdscr.clrtoeol()
+
+    prompt = f"{prompt_text} [{default_val}]: "
+    stdscr.addstr(h - 3, 2, prompt, curses.A_BOLD)
+
+    curses.echo()
+    curses.curs_set(1)
+    stdscr.timeout(-1) # Pause the auto-refresh to wait for input
+
+    try:
+        user_in = stdscr.getstr(h - 3, 2 + len(prompt)).decode('utf-8').strip()
+    except Exception:
+        user_in = ""
+
+    curses.noecho()
+    curses.curs_set(0)
+    stdscr.timeout(100) # Resume auto-refresh
+
+    return user_in if user_in else default_val
+
+def download_subtitles(video_path, lang='en'):
+    """Download subtitles using the subliminal CLI tool."""
+    if not shutil.which('subliminal'):
+        return None, "Error: 'subliminal' CLI not found. Install via 'pip install subliminal'."
+
+    base_dir = os.path.dirname(os.path.abspath(video_path))
+    existing_subs = set(f for f in os.listdir(base_dir) if f.lower().endswith(SUB_EXTS))
+
+    try:
+        cmd = ["subliminal", "download", "-l", lang, video_path]
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        return None, "Search timed out after 60 seconds."
+    except subprocess.CalledProcessError as e:
+        return None, f"Download failed: {e.stderr.strip()}"
+
+    new_subs = set(f for f in os.listdir(base_dir) if f.lower().endswith(SUB_EXTS))
+    downloaded = new_subs - existing_subs
+
+    if downloaded:
+        return os.path.join(base_dir, list(downloaded)[0]), None
+    return None, "No subtitles found by the provider."
+
+def prompt_metadata(stdscr, track, track_type):
+    """Prompt user for Jellyfin-compatible Language and Title metadata."""
+    h, w = stdscr.getmaxyx()
+
     curr_lang = track.get('edit_lang', track.get('lang', 'und'))
     
     if 'edit_title' in track:
@@ -399,7 +469,6 @@ def prompt_metadata(stdscr, track, track_type):
     if not curr_title:
         curr_title = "None"
         
-    # Clear a clean block at the bottom for the prompts
     for i in range(1, 6):
         stdscr.move(h - i, 0)
         stdscr.clrtoeol()
@@ -410,7 +479,6 @@ def prompt_metadata(stdscr, track, track_type):
     curses.curs_set(1)
     stdscr.timeout(-1)  # Disable timeout so prompt waits for user input
     
-    # Prompt 1: Jellyfin Language Code
     lang_prompt = f"Language (3-letter ISO, e.g., eng, jpn) [{curr_lang}]: "
     stdscr.addstr(h - 4, 2, lang_prompt)
     stdscr.refresh()
@@ -419,7 +487,6 @@ def prompt_metadata(stdscr, track, track_type):
     except Exception:
         lang_in = ""
         
-    # Prompt 2: Jellyfin Display Title
     title_prompt = f"Title (e.g., Stereo, Commentary. Type CLEAR to blank) [{curr_title}]: "
     stdscr.addstr(h - 3, 2, title_prompt)
     stdscr.refresh()
@@ -432,20 +499,14 @@ def prompt_metadata(stdscr, track, track_type):
     curses.curs_set(0)
     stdscr.timeout(100) # Restore 100ms timeout for the main loop
     
-    # Apply changes (saving them to 'edit_lang' and 'edit_title' state)
-    if lang_in:
-        track['edit_lang'] = lang_in.lower()
+    if lang_in: track['edit_lang'] = lang_in.lower()
     if title_in:
-        if title_in.upper() == "CLEAR":
-            track['edit_title'] = ""
-        else:
-            track['edit_title'] = title_in
+        if title_in.upper() == "CLEAR": track['edit_title'] = ""
+        else: track['edit_title'] = title_in
             
-    # Clear the prompt area before returning to the main menu
     for i in range(1, 6):
         stdscr.move(h - i, 0)
         stdscr.clrtoeol()
-
 
 def draw_menu(stdscr, full_path, tracks, output_path, cursor_pos, edit_mode, move_mode, is_batch=False, file_idx=0, total_files=0, auto_del_ext=False, track_type="Subtitle"):
     stdscr.erase()
@@ -459,12 +520,12 @@ def draw_menu(stdscr, full_path, tracks, output_path, cursor_pos, edit_mode, mov
         instr = "[UP/DOWN] Move Track | [M] Exit Move Mode"
         color = curses.color_pair(4)
     else:
-        nav_hint = " | [L/R Arrows] Skip File" if is_batch else ""
+        nav_hint = " | [L/R] Skip File" if is_batch else ""
         if track_type == "Subtitle":
             del_state = "ON" if auto_del_ext else "OFF"
-            instr = f"[Space/Click] Toggle | [D] Auto-Del: {del_state} | [M] Move | [E] Edit Meta | [C] Convert | [Enter] Run | [Q] Quit{nav_hint}"
+            instr = f"[Space/Click] Toggle | [S] Search | [D] Auto-Del: {del_state} | [M] Move | [E] Meta | [C] Conv | [Enter] Run | [Q] Quit{nav_hint}"
         else:
-            instr = f"[Space/Click] Toggle | [A] Auto-remove non-Eng | [M] Move | [E] Edit Meta | [Enter] Run/Next | [Q] Quit{nav_hint}"
+            instr = f"[Space/Click] Toggle | [A] Auto-remove non-Eng | [M] Move | [E] Meta | [Enter] Run/Next | [Q] Quit{nav_hint}"
         color = curses.A_DIM
         
     stdscr.addstr(1, 0, instr[:w-1], color)
@@ -601,7 +662,6 @@ def init_media_tracks(file_path):
                 codec_raw = s.get('codec_name', 'unknown')
                 channels = s.get('channels', 'unknown')
                 
-                # Scrub 'External' or messy titles from embedded audio as well
                 raw_title = s.get('tags', {}).get('title', '')
                 clean_title = re.sub(r'(?i)[-\s]*\bexternal\b[-\s]*', ' ', raw_title).strip(' -_')
 
@@ -678,9 +738,7 @@ def tui_main(stdscr, args, file_path, initial_tracks=None, is_batch=False, file_
         draw_menu(stdscr, full_path, tracks, output_path, cursor_pos, edit_mode, move_mode, is_batch, file_idx, total_files, auto_del_ext, track_type)
         
         key = stdscr.getch()
-        
-        while key == -1:
-            key = stdscr.getch()
+        while key == -1: key = stdscr.getch()
         
         if key == curses.KEY_MOUSE and not args.no_mouse:
             try:
@@ -751,14 +809,43 @@ def tui_main(stdscr, args, file_path, initial_tracks=None, is_batch=False, file_
             else:
                 sub['status'] = 'REMOVE' if sub['status'] != 'REMOVE' else 'KEEP'
                 
+        elif key in (ord('s'), ord('S')) and track_type == "Subtitle":
+            lang = prompt_simple_input(stdscr, "Language to search (2-char ISO, e.g., en, fr)", "en")
+            if not lang: continue
+
+            h, w = stdscr.getmaxyx()
+            stdscr.addstr(h - 3, 2, f"Searching subtitles for '{lang}' via subliminal... Please wait.", curses.A_REVERSE)
+            stdscr.refresh()
+
+            new_sub_path, error_msg = download_subtitles(full_path, lang)
+
+            # Flush input buffer to discard clicks/keys pressed during the blocking download
+            curses.flushinp()
+
+            if new_sub_path:
+                min_idx = min([t['original_index'] for t in tracks] + [0]) - 1
+                new_track = scan_single_external_sub(new_sub_path, min_idx)
+                if new_track:
+                    tracks.append(new_track)
+                    cursor_pos = len(tracks) - 1
+            else:
+                clean_msg = str(error_msg).replace('\n', ' ')
+                display_msg = f" {clean_msg} (Press any key) "[:w-4]
+                stdscr.addstr(h - 3, 2, display_msg, curses.color_pair(1) | curses.A_REVERSE)
+                stdscr.refresh()
+
+                stdscr.timeout(-1) # Pause UI refresh so the error can actually be read
+                stdscr.getch()
+                stdscr.timeout(100)
+
+            stdscr.move(h - 3, 0); stdscr.clrtoeol()
+
         elif key in (ord('d'), ord('D')) and track_type == "Subtitle":
             auto_del_ext = not auto_del_ext
             for s in tracks:
                 if s.get('is_external'):
-                    if auto_del_ext and s['status'] == 'KEEP':
-                        s['status'] = 'EMBED'
-                    elif not auto_del_ext and s['status'] == 'EMBED':
-                        s['status'] = 'KEEP'
+                    if auto_del_ext and s['status'] == 'KEEP': s['status'] = 'EMBED'
+                    elif not auto_del_ext and s['status'] == 'EMBED': s['status'] = 'KEEP'
                         
         elif key in (ord('a'), ord('A')): 
             for s in tracks:
@@ -770,8 +857,7 @@ def tui_main(stdscr, args, file_path, initial_tracks=None, is_batch=False, file_
             elif sub['is_text'] and sub['codec_raw'] != 'subrip': sub['status'] = 'CONVERT'
             
         elif key in (ord('e'), ord('E')):
-            if len(tracks) > 0:
-                prompt_metadata(stdscr, tracks[cursor_pos], track_type)
+            if len(tracks) > 0: prompt_metadata(stdscr, tracks[cursor_pos], track_type)
 
         elif key in (ord('m'), ord('M')): move_mode = True
         elif key in (ord('o'), ord('O')): edit_mode = True; curses.curs_set(1)
@@ -836,9 +922,12 @@ def has_file_changed(fpath, out_path, original_subs, new_subs, original_audio=No
 
 def main():
     global VERBOSITY
-    print_version()
 
-    parser = argparse.ArgumentParser(description="Interactive Media Manager")
+    parser = argparse.ArgumentParser(
+        description="Interactively manage subtitle and audio tracks in video files.",
+        add_help=False,
+    )
+    parser.add_argument("-h", "--help", action="help", help="Show this help message and exit")
     parser.add_argument("path", nargs="?", help="Input file or directory")
     parser.add_argument("-i", "--input", help="Input video file")
     parser.add_argument("-d", "--dir", help="Input directory")
@@ -851,6 +940,7 @@ def main():
     parser.add_argument("-V", "--very-verbose", action="store_true", help="Debug Mode")
     args = parser.parse_args()
 
+    print_version()
     if args.version: print(VERSION_HISTORY); sys.exit(0)
 
     if args.path and not args.input and not args.dir:
@@ -894,7 +984,6 @@ def main():
             print("Exiting.")
             sys.exit(0)
 
-    # Parallel Screening
     files_to_process = []
     preloaded_audio = {}
     preloaded_subs = {}
@@ -949,12 +1038,10 @@ def main():
     auto_del_ext = False
     execute_batch = False
 
-    # --- TUI Configuration Phase ---
     f_idx = 0
     while f_idx < len(files_to_process):
         fpath = files_to_process[f_idx]
         
-        # Determine Audio Processing Requirements
         if fpath not in audio_decision_cache:
             if args.audio:
                 audio_decision_cache[fpath] = True
@@ -1034,7 +1121,6 @@ def main():
     if not execute_batch:
         sys.exit(0)
         
-    # --- Batch Execution Phase ---
     log("\n==================================================", 1)
     log("            STARTING BATCH EXECUTION              ", 1)
     log("==================================================", 1)
